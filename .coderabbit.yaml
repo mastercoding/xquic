@@ -100,7 +100,7 @@ knowledge_base:
         xqc_conn_stats_t.paths_info[] with paths_info_count;
         xqc_wlb_scheduler_cb; xqc_conn_set_dgram_flow_hash;
         xqc_h3_ext_capsule_*, xqc_h3_ext_connectip_*, xqc_h3_ext_masque_*.
-        The behavioural contract is the "Consumer contract (mqvpn)" section
+        The behavioural contract is the "Consumer Contract (mqvpn)" section
         of harness/spec/architecture.md. When reviewing this fork: flag any
         change to a public struct layout, enum value, default setting,
         return code or callback semantics as consumer-visible and name the
