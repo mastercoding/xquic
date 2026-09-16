@@ -1544,6 +1544,34 @@ typedef struct xqc_conn_settings_s {
     uint32_t init_recv_window;
 
     /**
+     * Ceiling on the PER-STREAM receive window, in bytes.
+     *
+     * init_recv_window says where a stream's window starts; this says how
+     * large it may become. It bounds three things that otherwise all take
+     * XQC_MAX_RECV_WINDOW (16 MiB) unconditionally: the
+     * initial_max_stream_data_bidi_local and initial_max_stream_data_bidi_remote
+     * transport parameters this endpoint advertises, and the window doubling
+     * in xqc_stream_do_recv_flow_ctl().
+     *
+     * Default: 0, which selects XQC_MAX_RECV_WINDOW -- no behaviour change
+     * for a caller that does not set it. A value below init_recv_window is
+     * raised to init_recv_window, so the ceiling can never sit under the
+     * floor. The connection-level window is a different resource and is not
+     * affected; see recv_rate_bytes_per_sec for that one.
+     *
+     * Lowering it bounds per-stream reassembly memory and the reordering
+     * spread the receiver will absorb, at the cost of throughput on a
+     * long-fat or deeply-queued path.
+     *
+     * NOTE for a receiver that also lowers the reassembly cap: the window and
+     * the buffered-node cap have to be read together. A window of W bytes
+     * against an average frame of L bytes permits W/L nodes, and if that
+     * exceeds the cap the cap trips first and the peer sees repeated
+     * whole-packet drops instead of flow-control backpressure.
+     */
+    uint32_t max_recv_window;
+
+    /**
      * initial flow control value
      */
     xqc_bool_t is_interop_mode;

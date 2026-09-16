@@ -429,7 +429,7 @@ xqc_stream_do_recv_flow_ctl(xqc_stream_t *stream)
                  2 * min_srtt)) {
                 stream->stream_flow_ctl.fc_stream_recv_window_size =
                     xqc_min(stream->stream_flow_ctl.fc_stream_recv_window_size * 2,
-                            XQC_MAX_RECV_WINDOW);
+                            conn->conn_settings.max_recv_window);
             }
 
         } else {
@@ -443,8 +443,9 @@ xqc_stream_do_recv_flow_ctl(xqc_stream_t *stream)
             stream->stream_flow_ctl.fc_stream_recv_window_size =
                 xqc_max(conn->conn_settings.init_recv_window,
                         stream->stream_flow_ctl.fc_stream_recv_window_size);
-            stream->stream_flow_ctl.fc_stream_recv_window_size = xqc_min(
-                XQC_MAX_RECV_WINDOW, stream->stream_flow_ctl.fc_stream_recv_window_size);
+            stream->stream_flow_ctl.fc_stream_recv_window_size =
+                xqc_min(conn->conn_settings.max_recv_window,
+                        stream->stream_flow_ctl.fc_stream_recv_window_size);
             xqc_log(conn->log, XQC_LOG_DEBUG,
                     "|stream_level|fc_win_update|old_fc_win:%ui|fc_win:%ui|", old_fc_win,
                     stream->stream_flow_ctl.fc_stream_recv_window_size);
