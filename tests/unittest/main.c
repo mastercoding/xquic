@@ -216,6 +216,10 @@ main(int argc, char *argv[])
                         xqc_test_h3_body_buf_conn_arm_orphan)
         || !CU_add_test(pSuite, "xqc_test_h3_body_buf_pause_is_per_stream_only",
                         xqc_test_h3_body_buf_pause_is_per_stream_only)
+        || !CU_add_test(pSuite, "xqc_test_h3_blocked_buf_limit_closes_the_connection",
+                        xqc_test_h3_blocked_buf_limit_closes_the_connection)
+        || !CU_add_test(pSuite, "xqc_test_h3_blocked_buf_default_is_asymmetric",
+                        xqc_test_h3_blocked_buf_default_is_asymmetric)
                 || !CU_add_test(pSuite, "xqc_test_h3_settings_frame_size_limit", xqc_test_h3_settings_frame_size_limit)
         || !CU_add_test(pSuite, "xqc_test_h3_control_frame_unexpected", xqc_test_h3_control_frame_unexpected)
         || !CU_add_test(pSuite, "xqc_test_h3_missing_settings", xqc_test_h3_missing_settings)

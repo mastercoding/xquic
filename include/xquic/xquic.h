@@ -1662,6 +1662,33 @@ typedef struct xqc_conn_settings_s {
      * Maximum blocked buffer size per stream (bytes) for QPACK decode blocking.
      * This limits memory usage when QPACK decoding is blocked waiting for
      * dynamic table updates. Default: 0 (use internal default: 1MB)
+     *
+     * EXCEEDING THIS CLOSES THE CONNECTION. It is not backpressure and it is
+     * not a per-stream error: both enforcement sites --
+     * xqc_h3_stream_process_in() and xqc_h3_stream_process_blocked_data() --
+     * raise XQC_H3_CONN_ERR(h3c, H3_EXCESSIVE_LOAD, ...), which sets conn_err
+     * on the transport connection and flags it errored. Every stream on that
+     * connection goes down with it. The value is therefore the quantity of
+     * decode-blocked data a peer is allowed to deliver before the connection
+     * is torn down, and what a peer can deliver is a function of ITS encoder,
+     * the path's reordering and the transfer rate -- none of which the local
+     * side controls. An application multiplexing unrelated work over one
+     * HTTP/3 connection should size this against the worst legitimate case it
+     * can observe, not against a memory target.
+     *
+     * Pausing the stream instead is NOT a safe substitute, which is why this
+     * is enforced the way it is: a stream blocked on QPACK is waiting for
+     * encoder instructions that must arrive through the same connection-level
+     * receive window that suspending it would hold shut, so the pause can
+     * deadlock against the event it is waiting for. The body_buf bound below
+     * has no such shape -- it waits on the application, outside the
+     * connection.
+     *
+     * NOTE THE ASYMMETRY IN "DEFAULT: 0". The internal default is substituted
+     * only in xqc_server_set_conn_settings(); xqc_conn_create() assigns the
+     * caller's struct and defaults nothing. So leaving this at 0 gives a
+     * bounded, connection-fatal limit on servers and an UNBOUNDED buffer on
+     * clients, from one unset field.
      */
     size_t                      max_blocked_buf_per_stream;
 
@@ -1669,6 +1696,10 @@ typedef struct xqc_conn_settings_s {
      * Maximum total blocked buffer size per connection (bytes) for QPACK decode blocking.
      * This limits total memory usage across all blocked streams on a connection.
      * Default: 0 (use internal default: 8MB)
+     *
+     * Exceeding this closes the connection, exactly as the per-stream limit
+     * above does, and the same asymmetry applies to its default. Read that
+     * field's note before setting either.
      */
     size_t                      max_blocked_buf_per_conn;
 
