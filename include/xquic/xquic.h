@@ -1796,7 +1796,35 @@ typedef struct xqc_conn_settings_s {
      * drained to a quarter of the limit (see XQC_H3_BODY_BUF_LOW_WATER in
      * src/http3/xqc_h3_stream.h for the anti-flap rationale).
      *
-     * THE HONEST BOUND on a paused request is
+     * THE PAUSE IS PER STREAM AND ONLY PER STREAM, and that is a load-bearing
+     * property rather than a simplification. A request is suspended if and
+     * only if its OWN body_buf is at or above its own limit, and the only
+     * thing that can lower that number is that same request's own
+     * xqc_h3_request_recv_body(), which evaluates the resume on every call.
+     * One writer, one counter, one clearer: a suspended request always has
+     * bytes of its own for its application to collect, so it can never be left
+     * waiting on an event that belongs to some other stream. There is
+     * deliberately no connection-wide arm. An earlier revision of this change
+     * had one, and it could suspend a request holding ZERO bytes because of
+     * bytes a different request held; with nothing of its own to drain, its
+     * application never called recv_body, and since the gate had already taken
+     * the stream off conn_read_streams the only remaining re-arm was an
+     * arriving STREAM frame -- which never comes from a peer that has already
+     * sent everything. That stream stayed suspended for the life of the
+     * connection with its delivered bytes unread and no error raised.
+     *
+     * SO THIS SETTING DOES NOT BOUND A CONNECTION. The aggregate is
+     * (concurrently backlogged requests) x max_body_buf_per_stream, and the
+     * concurrency is the application's business, not this library's. On the
+     * evidence, that term is also not where the memory is: a suspended request
+     * holds at most max_body_buf_per_stream of parsed payload, while its
+     * transport reassembly queue holds up to a full stream receive window
+     * behind the frozen read point. Measured on one downstream deployment at a
+     * 256 KiB body_buf limit and a 16 MiB window: 262,144 B against a peak of
+     * 16,655,150 B of buffered STREAM frames on the same stream at the same
+     * instant. The lever for the aggregate is the receive window, not this.
+     *
+     * THE HONEST BOUND on a suspended request is
      *
      *     max_body_buf_per_stream + max_blocked_buf_per_stream + 4 KB
      *
@@ -1804,7 +1832,9 @@ typedef struct xqc_conn_settings_s {
      * table insertions takes a different read path
      * (xqc_h3_stream_process_blocked_data) which fills blocked_buf under its
      * own limit and is NOT gated here; and the pause is evaluated between 4 KB
-     * transport reads, so one chunk may land after the limit is reached.
+     * transport reads, so one chunk may land after the limit is reached. Note
+     * that max_blocked_buf_per_stream is enforced by closing the CONNECTION
+     * with H3_EXCESSIVE_LOAD, not by backpressure -- see its own doc.
      *
      * Payload bytes are what is counted, but each buffered DATA frame also
      * costs three allocations, so a peer framing DATA at a few bytes each
@@ -1825,26 +1855,6 @@ typedef struct xqc_conn_settings_s {
      * is source-compatible but not binary-compatible.
      */
     size_t                      max_body_buf_per_stream;
-
-    /**
-     * Maximum total buffered HTTP/3 DATA payload across every request stream
-     * on a connection, in bytes. Mirrors max_blocked_buf_per_conn.
-     *
-     * Non-zero pauses reading on a request stream once the connection total
-     * reaches this value, whatever that individual request holds.
-     *
-     * NOTE the cross-stream coupling that implies, and size it accordingly: a
-     * request that is over the connection limit pauses its peers too, and they
-     * resume only when the total falls back to a quarter of it. That is the
-     * same shape as max_blocked_buf_per_conn and it is bounded in the same
-     * way -- each paused request keeps notifying its application, so the total
-     * falls as any of them drains -- but it is a shared budget, and a value
-     * below (concurrent requests x max_body_buf_per_stream) will make slow
-     * readers visible to fast ones.
-     *
-     * Default: 0, meaning unbounded. Appended last; see above.
-     */
-    size_t                      max_body_buf_per_conn;
 } xqc_conn_settings_t;
 
 

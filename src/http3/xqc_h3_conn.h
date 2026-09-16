@@ -104,12 +104,13 @@ typedef struct xqc_h3_conn_s {
     /* blocked buffer monitoring */
     size_t                       total_blocked_buf_size;           /* current total blocked buffer size */
 
-    /* body buffer limits (0 = unbounded; see xqc_conn_settings_t) */
+    /*
+     * body buffer limit (0 = unbounded; see xqc_conn_settings_t). Per stream
+     * and only per stream, and there is deliberately no connection-wide
+     * counter beside it: a suspended request must be one its own application
+     * can free, and a total is by definition not that.
+     */
     size_t                       max_body_buf_per_stream;          /* effective limit per stream */
-    size_t                       max_body_buf_per_conn;            /* effective limit per connection */
-
-    /* body buffer monitoring */
-    size_t                       total_body_buf_size;              /* current total body buffer size */
 } xqc_h3_conn_t;
 
 

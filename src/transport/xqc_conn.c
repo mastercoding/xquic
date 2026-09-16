@@ -475,15 +475,13 @@ xqc_server_set_conn_settings(xqc_engine_t *engine, const xqc_conn_settings_t *se
      * Server connections inherit from default_conn_settings and THIS COPIER IS
      * FIELD-BY-FIELD, so a setting missing from it never reaches a server
      * connection at all -- xqc_conn_create() assigns the whole struct on the
-     * client path and needs no such line. Without these two the body_buf bound
+     * client path and needs no such line. Without this one the body_buf bound
      * would hold on a client and be silently ignored by every server, which no
      * client-side test can see. Zero is carried through unchanged: 0 means
-     * unbounded for both fields, so there is nothing to default here.
+     * unbounded, so there is nothing to default here.
      */
     engine->default_conn_settings.max_body_buf_per_stream =
         settings->max_body_buf_per_stream;
-    engine->default_conn_settings.max_body_buf_per_conn =
-        settings->max_body_buf_per_conn;
 
     /* compute effective blocked buffer limits (use default if not configured) */
     if (settings->max_blocked_buf_per_stream > 0) {
