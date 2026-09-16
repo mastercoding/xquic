@@ -532,6 +532,18 @@ xqc_h3_conn_create(xqc_connection_t *conn, void *user_data)
     xqc_log(h3c->log, XQC_LOG_DEBUG, "|blocked_buf_limits|per_stream:%uz|per_conn:%uz|",
             h3c->max_blocked_buf_per_stream, h3c->max_blocked_buf_per_conn);
 
+    /*
+     * read body buffer limits. Unlike the blocked-buffer pair above these have
+     * no internal default -- 0 means unbounded, which is the pre-existing
+     * behaviour -- so they are copied straight through on both the client and
+     * the server path.
+     */
+    h3c->max_body_buf_per_stream = conn->conn_settings.max_body_buf_per_stream;
+    h3c->max_body_buf_per_conn = conn->conn_settings.max_body_buf_per_conn;
+    h3c->total_body_buf_size = 0;
+    xqc_log(h3c->log, XQC_LOG_DEBUG, "|body_buf_limits|per_stream:%uz|per_conn:%uz|",
+            h3c->max_body_buf_per_stream, h3c->max_body_buf_per_conn);
+
     /* create qpack */
     h3c->qpack =
         xqc_qpack_create(h3c->local_h3_conn_settings.qpack_enc_max_table_capacity,

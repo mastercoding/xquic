@@ -37,6 +37,10 @@ typedef struct xqc_h3_request_s {
     /* received body buf list and statistic information */
     xqc_list_head_t                 body_buf;
     uint64_t                        body_buf_count;
+    /* payload bytes currently held in body_buf, i.e. read from the transport
+     * stream and not yet collected by the application. Drives the backpressure
+     * gate in xqc_h3_stream_process_data(). */
+    size_t                          body_buf_bytes;
     size_t                          body_recvd;
     size_t                          body_recvd_final_size;
 

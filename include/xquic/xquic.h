@@ -1775,6 +1775,76 @@ typedef struct xqc_conn_settings_s {
      * — libxquic currently carries no SOVERSION.
      */
     uint8_t                     defer_send_flush;
+
+    /**
+     * Maximum buffered HTTP/3 DATA payload per request stream, in bytes.
+     *
+     * A request's body_buf holds DATA frame payload that the HTTP/3 layer has
+     * already read out of the transport stream and that the application has
+     * not yet collected with xqc_h3_request_recv_body(). Because the H3 layer
+     * reads eagerly, QUIC stream flow control ends up measuring ARRIVAL rather
+     * than consumption: xqc_stream_recv() advances the read point and
+     * re-opens the receive window for every byte moved into body_buf, so a
+     * peer is never told to slow down and an application that reads more
+     * slowly than the peer sends grows that list without bound.
+     *
+     * Non-zero makes the H3 layer stop reading the transport stream once a
+     * request holds this many bytes. The read point then freezes, the window
+     * stops advancing, and the peer becomes flow-control blocked -- which is
+     * the backpressure RFC 9000 s4.1 already specifies, applied at the point
+     * where the bytes actually stop. Reading resumes once the application has
+     * drained to a quarter of the limit (see XQC_H3_BODY_BUF_LOW_WATER in
+     * src/http3/xqc_h3_stream.h for the anti-flap rationale).
+     *
+     * THE HONEST BOUND on a paused request is
+     *
+     *     max_body_buf_per_stream + max_blocked_buf_per_stream + 4 KB
+     *
+     * not max_body_buf_per_stream alone. A stream blocked on QPACK dynamic
+     * table insertions takes a different read path
+     * (xqc_h3_stream_process_blocked_data) which fills blocked_buf under its
+     * own limit and is NOT gated here; and the pause is evaluated between 4 KB
+     * transport reads, so one chunk may land after the limit is reached.
+     *
+     * Payload bytes are what is counted, but each buffered DATA frame also
+     * costs three allocations, so a peer framing DATA at a few bytes each
+     * would blow past the byte limit in metadata. A node bound is therefore
+     * derived from this same setting at 256 B/node -- the density the
+     * transport reassembly gate uses -- and whichever bound is reached first
+     * pauses the stream.
+     *
+     * Default: 0, meaning unbounded -- the behaviour of every release before
+     * this field existed. Deliberately NOT given an internal default, unlike
+     * max_blocked_buf_per_stream: switching a bound on by default would change
+     * the throughput of existing deployments, and pausing the reader is only
+     * safe once the stream reassembly cap sits above the receive window's node
+     * equivalent, which is a property of settings this library cannot see.
+     *
+     * ABI: appended last, so zero-filled and designated initialisers keep
+     * compiling. See the defer_send_flush note above -- enlarging this struct
+     * is source-compatible but not binary-compatible.
+     */
+    size_t                      max_body_buf_per_stream;
+
+    /**
+     * Maximum total buffered HTTP/3 DATA payload across every request stream
+     * on a connection, in bytes. Mirrors max_blocked_buf_per_conn.
+     *
+     * Non-zero pauses reading on a request stream once the connection total
+     * reaches this value, whatever that individual request holds.
+     *
+     * NOTE the cross-stream coupling that implies, and size it accordingly: a
+     * request that is over the connection limit pauses its peers too, and they
+     * resume only when the total falls back to a quarter of it. That is the
+     * same shape as max_blocked_buf_per_conn and it is bounded in the same
+     * way -- each paused request keeps notifying its application, so the total
+     * falls as any of them drains -- but it is a shared budget, and a value
+     * below (concurrent requests x max_body_buf_per_stream) will make slow
+     * readers visible to fast ones.
+     *
+     * Default: 0, meaning unbounded. Appended last; see above.
+     */
+    size_t                      max_body_buf_per_conn;
 } xqc_conn_settings_t;
 
 

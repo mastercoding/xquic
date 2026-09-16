@@ -1142,6 +1142,8 @@ xqc_h3_stream_process_request(xqc_h3_stream_t *h3s, unsigned char *data, size_t 
                     return ret;
                 }
                 h3s->h3r->body_buf_count++;
+                h3s->h3r->body_buf_bytes += len;
+                h3s->h3c->total_body_buf_size += len;
 
                 processed += len;
                 pctx->frame.consumed_len += len;
@@ -1874,6 +1876,99 @@ xqc_h3_stream_process_blocked_data(xqc_stream_t *stream, xqc_h3_stream_t *h3s,
 }
 
 
+/*
+ * Derived node bound: how many body_buf nodes a byte limit is allowed to buy.
+ * Never 0, so a tiny limit still admits one node and cannot wedge a stream
+ * that has read nothing.
+ */
+static inline uint64_t
+xqc_h3_body_buf_node_limit(size_t byte_limit)
+{
+    uint64_t nodes = (uint64_t)(byte_limit / XQC_H3_BODY_BUF_MIN_BYTES_PER_NODE);
+    return nodes > 0 ? nodes : 1;
+}
+
+
+/*
+ * Should xqc_h3_stream_process_data() stop reading the transport stream?
+ *
+ * Returning XQC_TRUE freezes the read point, which is the only lever the code
+ * offers: xqc_stream_do_recv_flow_ctl() is reached from exactly one place,
+ * inside xqc_stream_recv(), and the two quantities it measures advance only
+ * there. Stop calling it and the receive window stops moving, the peer runs
+ * out of credit and MAX_STREAM_DATA is simply not sent -- no new frame type,
+ * no negotiation, no way to deadlock on withheld credit, because
+ * xqc_stream_recv() does not return early on EAGAIN and so cannot lose a
+ * window update it was about to send.
+ */
+static xqc_bool_t
+xqc_h3_stream_body_buf_should_pause(xqc_h3_stream_t *h3s)
+{
+    xqc_h3_conn_t *h3c;
+    size_t         limit;
+
+    /*
+     * REQUEST streams that already have a request object, and nothing else.
+     * h3r shares a union with h3_ext_bs, so dereferencing it on a bytestream
+     * reads a different pointer entirely; and pausing a QPACK encoder/decoder
+     * stream or the H3 control stream would deadlock the connection, since the
+     * peer cannot make progress until those are consumed.
+     */
+    if (h3s->type != XQC_H3_STREAM_TYPE_REQUEST || h3s->h3r == NULL) {
+        return XQC_FALSE;
+    }
+
+    /*
+     * TERMINAL STATES ARE EXEMPT, and RESET_STREAM is why.
+     *
+     * xqc_stream_recv() is the only place a terminal receive state becomes
+     * visible to the H3 layer: its first three statements convert
+     * RESET_RECVD into RESET_READ, call xqc_stream_maybe_need_close() and
+     * return -XQC_ESTREAM_RESET. A gate that breaks ahead of that call and
+     * then calls xqc_stream_shutdown_read() would undo the re-arm that
+     * xqc_process_reset_stream_frame() had just performed -- and that handler
+     * has already destroyed frames_tailq, so no later STREAM frame can re-arm
+     * the stream either. The reset would never be delivered, the stream would
+     * never close, and the application would wait forever. A naive gate
+     * swallows the reset permanently.
+     *
+     * The other terminal condition xqc_stream_recv() converts -- FIN, i.e.
+     * stream_determined && next_read_offset == stream_length -- is deliberately
+     * NOT exempted. It cannot be reached while paused, because pausing freezes
+     * the read point strictly below stream_length, and the resume re-arms the
+     * stream, so FIN is DEFERRED until the application drains rather than
+     * lost. Deferring it is also correct: the application has not yet seen the
+     * body those bytes belong to.
+     */
+    if (h3s->stream == NULL
+        || h3s->stream->stream_state_recv >= XQC_RECV_STREAM_ST_RESET_RECVD)
+    {
+        return XQC_FALSE;
+    }
+
+    h3c = h3s->h3c;
+    limit = h3c->max_body_buf_per_stream;
+
+    if (limit > 0) {
+        if (h3s->h3r->body_buf_bytes >= limit) {
+            return XQC_TRUE;
+        }
+        /* metadata bound; see XQC_H3_BODY_BUF_MIN_BYTES_PER_NODE */
+        if (h3s->h3r->body_buf_count >= xqc_h3_body_buf_node_limit(limit)) {
+            return XQC_TRUE;
+        }
+    }
+
+    if (h3c->max_body_buf_per_conn > 0
+        && h3c->total_body_buf_size >= h3c->max_body_buf_per_conn)
+    {
+        return XQC_TRUE;
+    }
+
+    return XQC_FALSE;
+}
+
+
 xqc_int_t
 xqc_h3_stream_process_data(xqc_stream_t *stream, xqc_h3_stream_t *h3s, xqc_bool_t *fin)
 {
@@ -1885,6 +1980,33 @@ xqc_h3_stream_process_data(xqc_stream_t *stream, xqc_h3_stream_t *h3s, xqc_bool_
     uint64_t insert_cnt = xqc_qpack_get_dec_insert_count(h3s->qpack);
 
     do {
+        /*
+         * BACKPRESSURE. Checked here, ahead of xqc_stream_recv() and on the
+         * first iteration as well as later ones, so an already-full request
+         * reads nothing at all.
+         *
+         * xqc_stream_shutdown_read() MUST be called explicitly. It normally
+         * runs inside xqc_stream_recv(), which we are about to skip; skipping
+         * the read without de-arming would leave the stream on
+         * conn_read_streams with XQC_STREAM_FLAG_READY_TO_READ still set, and
+         * xqc_process_read_streams() would re-enter this function on every
+         * engine tick, doing no work, forever. Deleting the current entry is
+         * safe under the caller's xqc_list_for_each_safe.
+         *
+         * break, not return: the QPACK insert-count check at the tail of this
+         * function must still run, or a peer's dynamic-table insertions
+         * carried in the same read would leave other blocked streams stuck.
+         */
+        if (xqc_h3_stream_body_buf_should_pause(h3s)) {
+            h3s->flags |= XQC_HTTP3_STREAM_FLAG_BODY_BUF_PAUSED;
+            xqc_stream_shutdown_read(stream);
+            xqc_log(h3c->log, XQC_LOG_DEBUG,
+                    "|body_buf paused|stream_id:%ui|bytes:%uz|nodes:%ui|conn_total:%uz|",
+                    h3s->stream_id, h3s->h3r->body_buf_bytes,
+                    h3s->h3r->body_buf_count, h3c->total_body_buf_size);
+            break;
+        }
+
         /* recv data from transport stream */
         read = xqc_stream_recv(h3s->stream, buff, buff_size, fin);
         if (read == -XQC_EAGAIN) {
