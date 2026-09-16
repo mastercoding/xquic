@@ -19,7 +19,9 @@ authoritative contribution contract. Check every requirement before review:
 
 - the branch uses the documented pattern for its task type: `dev/` for a new
   feature, `fix/` for a bug fix, `perf/` for a performance optimization or
-  other enhancement, or `doc/` for documentation;
+  other enhancement, or `doc/` for documentation; on `mqvpn-*` branches the
+  conventional prefixes already in use here (`feat/`, `chore/`, `refactor/`)
+  are accepted alongside them (a fork-local exception to CONTRIBUTING.md);
 - every commit header follows `[<type>]: <subject>` with an allowed `+`, `-`,
   `=`, or `~` type; on `mqvpn-*` branches a conventional header
   (`type: subject` or `type(scope): subject`) is accepted alongside it (a
