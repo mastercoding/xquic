@@ -12,6 +12,8 @@
 #include "src/http3/xqc_h3_header.h"
 #include "src/http3/qpack/xqc_qpack.h"
 #include "src/transport/xqc_stream.h"
+#include "src/transport/xqc_frame.h"
+#include "src/transport/xqc_engine.h"
 #include "src/http3/qpack/stable/xqc_stable.h"
 
 #include "xqc_common_test.h"
@@ -2187,4 +2189,720 @@ xqc_test_h3_settings_frame_size_limit()
     ret = xqc_h3_frm_parse(normal_settings, sizeof(normal_settings), &pctx);
     /* normal-sized SETTINGS frame should parse successfully */
     CU_ASSERT(ret >= 0);
+}
+
+
+/* ======================================================================
+ * PLAN SECTION 2, STEP 2 -- the body_buf bound, pause and re-arm.
+ *
+ * The defect: body_buf holds HTTP/3 DATA payload that the H3 layer has
+ * already pulled out of the transport stream. Because xqc_stream_recv()
+ * both advances the read point and re-opens the receive window, QUIC flow
+ * control measures ARRIVAL, not consumption -- so an application reading
+ * more slowly than the peer sends grows that list with no limit anywhere.
+ *
+ * The fix pauses the H3 read instead, which freezes the read point and lets
+ * the window close. These five cases pin the parts of that which are easy to
+ * get subtly wrong; the anti-spin case was written before the gate existed
+ * and is the reason the gate calls xqc_stream_shutdown_read() explicitly.
+ * ====================================================================== */
+
+/* one H3 DATA frame: varint type 0x00, varint length, payload. Lengths here
+ * stay under 16384 so the length is a one- or two-byte varint. */
+static size_t
+xqc_h3_bb_put_data_frame(unsigned char *out, size_t payload_len, unsigned char fill)
+{
+    size_t n = 0;
+    out[n++] = 0x00;                                    /* DATA */
+    if (payload_len < 64) {
+        out[n++] = (unsigned char)payload_len;
+    } else {
+        out[n++] = (unsigned char)(0x40 | (payload_len >> 8));
+        out[n++] = (unsigned char)(payload_len & 0xff);
+    }
+    memset(out + n, fill, payload_len);
+    return n + payload_len;
+}
+
+/* hand `len` bytes to the transport stream as one STREAM frame at *offset,
+ * contiguous with what came before so merged_offset_end advances. */
+static xqc_int_t
+xqc_h3_bb_feed(xqc_connection_t *conn, xqc_stream_t *stream, uint64_t *offset,
+    const unsigned char *data, size_t len)
+{
+    xqc_stream_frame_t *f = xqc_calloc(1, sizeof(xqc_stream_frame_t));
+    xqc_int_t ret;
+
+    f->data_offset = *offset;
+    f->data_length = len;
+    f->data = xqc_malloc(len);
+    memcpy(f->data, data, len);
+
+    ret = xqc_insert_stream_frame(conn, stream, f);
+    if (ret != XQC_OK) {
+        xqc_destroy_stream_frame(f);
+        return ret;
+    }
+    *offset += len;
+    return XQC_OK;
+}
+
+/* counting wrapper around the real H3 read notify, so a test can tell how
+ * many times the engine actually entered the H3 layer. */
+static int xqc_h3_bb_notify_count;
+
+static xqc_int_t
+xqc_h3_bb_counting_read_notify(xqc_stream_t *stream, void *user_data)
+{
+    xqc_h3_bb_notify_count++;
+    return h3_stream_callbacks.stream_read_notify(stream, user_data);
+}
+
+/* non-const: xqc_stream_t::stream_if is a plain pointer */
+static xqc_stream_callbacks_t xqc_h3_bb_stream_cbs = {
+    .stream_read_notify = xqc_h3_bb_counting_read_notify,
+};
+
+typedef struct {
+    xqc_connection_t *conn;
+    xqc_h3_conn_t    *h3c;
+    xqc_h3_stream_t  *h3s;
+    xqc_stream_t     *stream;
+    uint64_t          offset;       /* next transport stream offset to feed */
+} xqc_h3_bb_fixture_t;
+
+/*
+ * A client connection carrying one REQUEST stream wired to the real H3
+ * callbacks, with both flow-control windows opened wide so the transport
+ * reassembly path is never what stops the test.
+ */
+static xqc_bool_t
+xqc_h3_bb_setup_win(xqc_h3_bb_fixture_t *fx, size_t per_stream, size_t per_conn,
+    uint64_t stream_window)
+{
+    memset(fx, 0, sizeof(*fx));
+
+    fx->conn = test_engine_connect();
+    if (fx->conn == NULL) {
+        return XQC_FALSE;
+    }
+
+    if (fx->conn->alpn) {
+        xqc_free(fx->conn->alpn);
+    }
+    fx->conn->alpn_len = strlen(XQC_ALPN_H3);
+    fx->conn->alpn = xqc_calloc(1, fx->conn->alpn_len + 1);
+    xqc_memcpy(fx->conn->alpn, XQC_ALPN_H3, fx->conn->alpn_len);
+
+    fx->conn->conn_flow_ctl.fc_max_streams_bidi_can_send = 1024;
+    fx->conn->conn_state = XQC_CONN_STATE_ESTABED;
+
+    fx->h3c = xqc_h3_conn_create(fx->conn, NULL);
+    if (fx->h3c == NULL) {
+        return XQC_FALSE;
+    }
+    /* xqc_h3_stream_process_data() and _read_notify() both take h3c from
+     * here, so it has to be wired as the real ALPN path would wire it. */
+    fx->conn->proto_data = fx->h3c;
+
+    /* the settings under test. 0 would mean unbounded. */
+    fx->h3c->max_body_buf_per_stream = per_stream;
+    fx->h3c->max_body_buf_per_conn = per_conn;
+    fx->h3c->total_body_buf_size = 0;
+
+    fx->stream = xqc_create_stream_with_conn(fx->conn, XQC_UNDEFINE_STREAM_ID,
+                                             XQC_CLI_BID, NULL, NULL);
+    if (fx->stream == NULL) {
+        return XQC_FALSE;
+    }
+    fx->stream->stream_if = &xqc_h3_bb_stream_cbs;
+    fx->stream->stream_flow_ctl.fc_max_stream_data_can_recv = stream_window;
+    fx->stream->stream_flow_ctl.fc_stream_recv_window_size = stream_window;
+    /* the connection window is deliberately never the binding constraint
+     * here; it is a different resource and a different question. */
+    fx->conn->conn_flow_ctl.fc_max_data_can_recv = 1024ull * 1024 * 1024;
+
+    fx->h3s = xqc_h3_stream_create(fx->h3c, fx->stream,
+                                   XQC_H3_STREAM_TYPE_REQUEST, NULL);
+    if (fx->h3s == NULL) {
+        return XQC_FALSE;
+    }
+    fx->h3s->h3r = xqc_h3_request_create_inner(fx->h3c, fx->h3s, NULL);
+    if (fx->h3s->h3r == NULL) {
+        return XQC_FALSE;
+    }
+
+    fx->offset = 0;
+    xqc_h3_bb_notify_count = 0;
+    return XQC_TRUE;
+}
+
+/* a window wide enough that flow control never intervenes */
+static xqc_bool_t
+xqc_h3_bb_setup(xqc_h3_bb_fixture_t *fx, size_t per_stream, size_t per_conn)
+{
+    return xqc_h3_bb_setup_win(fx, per_stream, per_conn, 64ull * 1024 * 1024);
+}
+
+static void
+xqc_h3_bb_teardown(xqc_h3_bb_fixture_t *fx)
+{
+    if (fx->h3s) {
+        if (fx->stream) {
+            fx->stream->stream_flag |= XQC_STREAM_FLAG_DISCARDED;
+        }
+        xqc_h3_stream_destroy(fx->h3s);
+    }
+    if (fx->stream) {
+        xqc_destroy_stream(fx->stream);
+    }
+    if (fx->h3c) {
+        xqc_h3_conn_destroy(fx->h3c);
+    }
+    if (fx->conn) {
+        if (fx->conn->alpn) {
+            xqc_free(fx->conn->alpn);
+            fx->conn->alpn = NULL;
+        }
+        xqc_engine_destroy(fx->conn->engine);
+    }
+}
+
+/* feed `frames` DATA frames of `payload` bytes and run one engine read pass */
+static void
+xqc_h3_bb_feed_and_run(xqc_h3_bb_fixture_t *fx, int frames, size_t payload)
+{
+    unsigned char buf[8192];
+    int i;
+
+    for (i = 0; i < frames; i++) {
+        size_t n = xqc_h3_bb_put_data_frame(buf, payload, (unsigned char)('a' + (i % 26)));
+        if (xqc_h3_bb_feed(fx->conn, fx->stream, &fx->offset, buf, n) != XQC_OK) {
+            break;
+        }
+    }
+    xqc_stream_ready_to_read(fx->stream);
+    xqc_process_read_streams(fx->conn);
+}
+
+
+/*
+ * TEST 2 OF THE PLAN'S FIVE, AND THE ONE THAT WAS WRITTEN FIRST.
+ *
+ * xqc_stream_shutdown_read() -- the call that takes a stream off
+ * conn_read_streams and clears XQC_STREAM_FLAG_READY_TO_READ -- lives INSIDE
+ * xqc_stream_recv(), near the end. A gate that decides not to call
+ * xqc_stream_recv() therefore skips the de-arm too, and the stream stays
+ * armed with no new data ever being consumed:
+ * xqc_process_read_streams() re-enters the H3 layer on every engine tick,
+ * forever, burning a notify per tick per wedged flow. On a box with hundreds
+ * of paused LAN flows that is the whole CPU.
+ *
+ * So: pause the stream, then run the read-stream pass repeatedly with no new
+ * packets arriving, and require the notify count to stop growing.
+ *
+ * One notify per ARRIVING PACKET is expected and correct -- xqc_process_
+ * stream_frame() calls xqc_stream_ready_to_read() on every STREAM frame it
+ * accepts, so a paused stream is legitimately re-armed by arrivals and
+ * re-pauses. It is growth PER IDLE TICK that is the bug.
+ *
+ * Shape note: xqc_stream_ready_to_read() re-adds at the TAIL of
+ * conn_read_streams, so with other streams present the same stream can be
+ * notified twice within one xqc_list_for_each_safe pass. That terminates, but
+ * it means the count is not simply "one per stream per pass", and the
+ * assertion is written to allow it.
+ */
+void
+xqc_test_h3_body_buf_no_spin()
+{
+    xqc_h3_bb_fixture_t fx;
+    int after_pause, after_ticks, i;
+
+    CU_ASSERT_FATAL(xqc_h3_bb_setup(&fx, 8192, 0) == XQC_TRUE);
+
+    /*
+     * Well past the 8192 B limit. It has to be well past: the gate is
+     * evaluated at the top of each 4 KB transport read, so a feed that the
+     * read loop drains in two or three chunks exits the loop naturally and
+     * never reaches the check. That is correct -- the overshoot is bounded by
+     * one chunk either way -- but it means a small feed proves nothing.
+     */
+    xqc_h3_bb_feed_and_run(&fx, 40, 3000);
+
+    CU_ASSERT_FATAL(fx.h3s->flags & XQC_HTTP3_STREAM_FLAG_BODY_BUF_PAUSED);
+
+    /*
+     * THE CASE THAT MATTERS, and it is not the one reached above.
+     *
+     * Every xqc_stream_recv() call ends in xqc_stream_shutdown_read(), so a
+     * pause that happens part-way through the read loop finds the stream
+     * already de-armed by the previous iteration -- and a gate missing its
+     * own de-arm still looks correct there. The spin lives in the steady
+     * state instead: the request is ALREADY over its limit, the peer keeps
+     * sending, xqc_process_stream_frame() calls xqc_stream_ready_to_read()
+     * on every accepted STREAM frame, and the gate then fires on the FIRST
+     * loop iteration with no xqc_stream_recv() call at all. Nothing de-arms
+     * unless the gate does it itself, and xqc_process_read_streams()
+     * re-enters the H3 layer on every engine tick from then on, forever --
+     * one wasted notify per tick per wedged flow, which on a box holding
+     * hundreds of them is the whole CPU.
+     *
+     * So: re-arm exactly as an arrival would, take one pass, then let the
+     * engine tick with nothing arriving.
+     */
+    xqc_stream_ready_to_read(fx.stream);
+    xqc_process_read_streams(fx.conn);
+
+    CU_ASSERT(fx.h3s->flags & XQC_HTTP3_STREAM_FLAG_BODY_BUF_PAUSED);
+    /* the de-arm itself, stated directly */
+    CU_ASSERT_FALSE(fx.stream->stream_flag & XQC_STREAM_FLAG_READY_TO_READ);
+    CU_ASSERT(xqc_list_empty(&fx.stream->read_stream_list));
+
+    after_pause = xqc_h3_bb_notify_count;
+
+    /* engine ticks with nothing arriving */
+    for (i = 0; i < 50; i++) {
+        xqc_process_read_streams(fx.conn);
+    }
+    after_ticks = xqc_h3_bb_notify_count;
+
+    /* THE ASSERTION: idle ticks cost nothing. */
+    CU_ASSERT_EQUAL(after_ticks, after_pause);
+
+    /*
+     * And the converse, so the assertion above cannot be satisfied by a
+     * stream that has merely gone dead: one ARRIVAL still costs notifies,
+     * and the ticks after it are free again. One notify per arriving packet
+     * is expected and correct; it is growth per IDLE TICK that is the bug.
+     */
+    xqc_stream_ready_to_read(fx.stream);
+    xqc_process_read_streams(fx.conn);
+    CU_ASSERT(xqc_h3_bb_notify_count > after_ticks);
+    after_ticks = xqc_h3_bb_notify_count;
+    for (i = 0; i < 20; i++) {
+        xqc_process_read_streams(fx.conn);
+    }
+    CU_ASSERT_EQUAL(xqc_h3_bb_notify_count, after_ticks);
+
+    /* and the pause held rather than being an artefact of a closed stream */
+    CU_ASSERT(fx.h3s->flags & XQC_HTTP3_STREAM_FLAG_BODY_BUF_PAUSED);
+    CU_ASSERT(fx.conn->conn_state == XQC_CONN_STATE_ESTABED);
+
+    xqc_h3_bb_teardown(&fx);
+}
+
+
+/*
+ * THE FLAG BIT. Cheap, and it pins the one mistake in this change that would
+ * corrupt memory rather than merely misbehave.
+ *
+ * "The next bit after XQC_HTTP3_STREAM_IN_READING = 0x0800" is 0x1000, and
+ * 0x1000 is XQC_HTTP3_STREAM_FLAG_ACTIVELY_CLOSED -- which gates the
+ * delayed-destroy branch of xqc_h3_stream_close_notify(), i.e. exactly the
+ * path on which a paused request is still alive with h3s->stream == NULL.
+ * A paused stream reading as actively closed would take the wrong branch
+ * there. 0x2000 is FIN_SENT. 0x4000 is the first free bit.
+ */
+void
+xqc_test_h3_body_buf_flag_bit_is_free()
+{
+    static const unsigned taken[] = {
+        XQC_HTTP3_STREAM_FLAG_TYPE_IDENTIFIED,
+        XQC_HTTP3_STREAM_FLAG_FC_BLOCKED,
+        XQC_HTTP3_STREAM_FLAG_READ_DATA_BLOCKED,
+        XQC_HTTP3_STREAM_FLAG_WRITE_END_STREAM,
+        XQC_HTTP3_STREAM_FLAG_QPACK_DECODE_BLOCKED,
+        XQC_HTTP3_STREAM_FLAG_READ_EOF,
+        XQC_HTTP3_STREAM_FLAG_CLOSED,
+        XQC_HTTP3_STREAM_FLAG_PUSH_PROMISE_BLOCKED,
+        XQC_HTTP3_STREAM_FLAG_PRIORITY_SET,
+        XQC_HTTP3_STREAM_FLAG_RESET,
+        XQC_HTTP3_STREAM_NEED_WRITE_NOTIFY,
+        XQC_HTTP3_STREAM_IN_READING,
+        XQC_HTTP3_STREAM_FLAG_ACTIVELY_CLOSED,
+        XQC_HTTP3_STREAM_FLAG_FIN_SENT,
+    };
+    size_t i;
+
+    for (i = 0; i < sizeof(taken) / sizeof(taken[0]); i++) {
+        CU_ASSERT_EQUAL(XQC_HTTP3_STREAM_FLAG_BODY_BUF_PAUSED & taken[i], 0);
+    }
+    /* named separately, because this is the collision that was proposed */
+    CU_ASSERT_EQUAL(XQC_HTTP3_STREAM_FLAG_BODY_BUF_PAUSED
+                    & XQC_HTTP3_STREAM_FLAG_ACTIVELY_CLOSED, 0);
+    CU_ASSERT_EQUAL(XQC_HTTP3_STREAM_FLAG_BODY_BUF_PAUSED, 0x4000);
+}
+
+
+/*
+ * THE SHAPE WITH MORE THAN ONE STREAM, and the property the product actually
+ * cares about: ONE WEDGED FLOW MUST NOT FREEZE THE OTHERS.
+ *
+ * Two things are being pinned here.
+ *
+ * (a) Termination. xqc_stream_ready_to_read() re-adds at the TAIL of
+ *     conn_read_streams, and xqc_process_read_streams() walks that list with
+ *     xqc_list_for_each_safe -- so a stream re-armed during a pass can be
+ *     visited again within the SAME pass. That terminates, because the gate
+ *     de-arms rather than re-arms, but "it terminates" is exactly the kind of
+ *     claim that should be a test rather than a comment.
+ *
+ * (b) Independence. A paused request holds only its own transport stream
+ *     shut. Nothing here touches the connection-level receive window --
+ *     deliberately, because that window is a SHARED budget measured as
+ *     received-minus-read summed over every stream, and clamping it would let
+ *     a single laptop on weak Wi-Fi freeze every other flow through the
+ *     tunnel. That would be the same "everything stops" symptom this bound
+ *     exists to remove, with a more ordinary trigger.
+ */
+void
+xqc_test_h3_body_buf_second_stream_unaffected()
+{
+    xqc_h3_bb_fixture_t fx;
+    xqc_stream_t *s2;
+    xqc_h3_stream_t *h3s2;
+    unsigned char frame[8192];
+    unsigned char sink[64 * 1024];
+    uint64_t off2 = 0, s1_read_point, s2_read_point;
+    uint8_t fin = 0;
+    int round, before_idle, i;
+
+    CU_ASSERT_FATAL(xqc_h3_bb_setup(&fx, 8192, 0) == XQC_TRUE);
+
+    /* a second request stream on the same connection */
+    s2 = xqc_create_stream_with_conn(fx.conn, XQC_UNDEFINE_STREAM_ID,
+                                     XQC_CLI_BID, NULL, NULL);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(s2);
+    s2->stream_if = &xqc_h3_bb_stream_cbs;
+    s2->stream_flow_ctl.fc_max_stream_data_can_recv = 64ull * 1024 * 1024;
+    s2->stream_flow_ctl.fc_stream_recv_window_size = 64ull * 1024 * 1024;
+    h3s2 = xqc_h3_stream_create(fx.h3c, s2, XQC_H3_STREAM_TYPE_REQUEST, NULL);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(h3s2);
+    h3s2->h3r = xqc_h3_request_create_inner(fx.h3c, h3s2, NULL);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(h3s2->h3r);
+
+    /* wedge the first stream: its application never reads */
+    xqc_h3_bb_feed_and_run(&fx, 40, 3000);
+    CU_ASSERT_FATAL(fx.h3s->flags & XQC_HTTP3_STREAM_FLAG_BODY_BUF_PAUSED);
+    s1_read_point = fx.stream->stream_data_in.next_read_offset;
+
+    /* the second stream's application behaves: feed, engine pass, drain */
+    s2_read_point = s2->stream_data_in.next_read_offset;
+    for (round = 0; round < 5; round++) {
+        size_t n = xqc_h3_bb_put_data_frame(frame, 3000, 'q');
+        CU_ASSERT_EQUAL_FATAL(xqc_h3_bb_feed(fx.conn, s2, &off2, frame, n), XQC_OK);
+
+        /* both streams are on conn_read_streams for this pass: the paused
+         * one is re-armed exactly as its own arrivals would re-arm it */
+        xqc_stream_ready_to_read(fx.stream);
+        xqc_stream_ready_to_read(s2);
+        xqc_process_read_streams(fx.conn);
+
+        fin = 0;
+        (void)xqc_h3_request_recv_body(h3s2->h3r, sink, sizeof(sink), &fin);
+
+        /* the healthy stream moves every round */
+        CU_ASSERT(s2->stream_data_in.next_read_offset > s2_read_point);
+        s2_read_point = s2->stream_data_in.next_read_offset;
+        /* and is never itself paused */
+        CU_ASSERT_FALSE(h3s2->flags & XQC_HTTP3_STREAM_FLAG_BODY_BUF_PAUSED);
+    }
+
+    /* the wedged stream stayed exactly where it was throughout */
+    CU_ASSERT(fx.h3s->flags & XQC_HTTP3_STREAM_FLAG_BODY_BUF_PAUSED);
+    CU_ASSERT_EQUAL(fx.stream->stream_data_in.next_read_offset, s1_read_point);
+
+    /* and with both of them quiet, idle ticks still cost nothing */
+    before_idle = xqc_h3_bb_notify_count;
+    for (i = 0; i < 20; i++) {
+        xqc_process_read_streams(fx.conn);
+    }
+    CU_ASSERT_EQUAL(xqc_h3_bb_notify_count, before_idle);
+
+    CU_ASSERT_EQUAL(fx.conn->conn_err, 0);
+
+    s2->stream_flag |= XQC_STREAM_FLAG_DISCARDED;
+    xqc_h3_stream_destroy(h3s2);
+    xqc_destroy_stream(s2);
+    xqc_h3_bb_teardown(&fx);
+}
+
+
+/*
+ * TEST 1. The bound itself, and the two transport quantities that prove the
+ * peer is really being told to slow down rather than the bytes merely being
+ * counted somewhere else.
+ *
+ * The limit is 8192 B. The overshoot allowance is one 4 KB transport read,
+ * because the gate is evaluated between reads, not between DATA frames.
+ */
+void
+xqc_test_h3_body_buf_backpressure()
+{
+    xqc_h3_bb_fixture_t fx;
+    uint64_t read_point_at_pause, fc_at_pause;
+
+    CU_ASSERT_FATAL(xqc_h3_bb_setup(&fx, 8192, 0) == XQC_TRUE);
+
+    /* far more than the limit, never collected by the application */
+    xqc_h3_bb_feed_and_run(&fx, 40, 3000);
+
+    CU_ASSERT(fx.h3s->flags & XQC_HTTP3_STREAM_FLAG_BODY_BUF_PAUSED);
+    CU_ASSERT(fx.h3s->h3r->body_buf_bytes <= 8192 + XQC_DATA_BUF_SIZE_4K);
+    CU_ASSERT(fx.h3s->h3r->body_buf_bytes >= 8192);
+    /* the connection counter tracks the same bytes */
+    CU_ASSERT_EQUAL(fx.h3c->total_body_buf_size, fx.h3s->h3r->body_buf_bytes);
+
+    read_point_at_pause = fx.stream->stream_data_in.next_read_offset;
+    fc_at_pause = fx.stream->stream_flow_ctl.fc_max_stream_data_can_recv;
+
+    /* more data arrives and is accepted by the transport, but the H3 layer
+     * does not touch it: the read point and the advertised limit both stay
+     * exactly where they were. That is the backpressure. */
+    xqc_h3_bb_feed_and_run(&fx, 40, 3000);
+
+    CU_ASSERT_EQUAL(fx.stream->stream_data_in.next_read_offset, read_point_at_pause);
+    CU_ASSERT_EQUAL(fx.stream->stream_flow_ctl.fc_max_stream_data_can_recv, fc_at_pause);
+    CU_ASSERT(fx.h3s->h3r->body_buf_bytes <= 8192 + XQC_DATA_BUF_SIZE_4K);
+
+    /* and none of this is an error: the connection is healthy, it is just
+     * not reading. A bound that killed the connection would be no fix. */
+    CU_ASSERT_EQUAL(fx.conn->conn_err, 0);
+    CU_ASSERT(fx.conn->conn_state == XQC_CONN_STATE_ESTABED);
+
+    xqc_h3_bb_teardown(&fx);
+}
+
+
+/*
+ * TEST 3. The resume, and the use-after-free guard on it.
+ *
+ * Draining below the low watermark must clear the flag, put the stream back
+ * on conn_read_streams, and let the next engine pass move the read point and
+ * re-open the window. Then the same drain is performed against a request
+ * whose transport stream has already been closed -- h3s->stream == NULL, the
+ * delayed-destroy shape -- and must not touch it.
+ */
+void
+xqc_test_h3_body_buf_resume()
+{
+    xqc_h3_bb_fixture_t fx;
+    unsigned char sink[64 * 1024];
+    uint8_t fin = 0;
+    uint64_t read_point_at_pause, fc_at_pause, prev_read_point;
+    ssize_t got;
+    int round;
+
+    /* a 128 KiB stream window, so the window is small enough for the read
+     * point to cross half of it and make the auto-tune in
+     * xqc_stream_do_recv_flow_ctl() fire within the test */
+    CU_ASSERT_FATAL(xqc_h3_bb_setup_win(&fx, 8192, 0, 128 * 1024) == XQC_TRUE);
+
+    xqc_h3_bb_feed_and_run(&fx, 40, 3000);
+    CU_ASSERT_FATAL(fx.h3s->flags & XQC_HTTP3_STREAM_FLAG_BODY_BUF_PAUSED);
+
+    read_point_at_pause = fx.stream->stream_data_in.next_read_offset;
+    fc_at_pause = fx.stream->stream_flow_ctl.fc_max_stream_data_can_recv;
+
+    /* the application collects everything */
+    got = xqc_h3_request_recv_body(fx.h3s->h3r, sink, sizeof(sink), &fin);
+    CU_ASSERT(got > 0);
+    CU_ASSERT(fx.h3s->h3r->body_buf_bytes
+              <= XQC_H3_BODY_BUF_LOW_WATER((size_t)8192));
+
+    /* flag cleared and the stream re-armed */
+    CU_ASSERT_FALSE(fx.h3s->flags & XQC_HTTP3_STREAM_FLAG_BODY_BUF_PAUSED);
+    CU_ASSERT(fx.stream->stream_flag & XQC_STREAM_FLAG_READY_TO_READ);
+
+    /*
+     * And the cycle actually moves the tunnel. Each round is one engine read
+     * pass followed by one application drain -- the steady state a slow LAN
+     * reader puts the box in -- and each must advance the read point. Once
+     * the read point passes half the window, xqc_stream_do_recv_flow_ctl()
+     * raises fc_max_stream_data_can_recv and writes MAX_STREAM_DATA: that is
+     * the peer being given more credit, which is the whole point of pausing
+     * rather than buffering.
+     */
+    prev_read_point = read_point_at_pause;
+    for (round = 0; round < 16; round++) {
+        xqc_process_read_streams(fx.conn);
+        CU_ASSERT(fx.stream->stream_data_in.next_read_offset > prev_read_point);
+        prev_read_point = fx.stream->stream_data_in.next_read_offset;
+
+        fin = 0;
+        (void)xqc_h3_request_recv_body(fx.h3s->h3r, sink, sizeof(sink), &fin);
+        CU_ASSERT_FALSE(fx.h3s->flags & XQC_HTTP3_STREAM_FLAG_BODY_BUF_PAUSED);
+
+        if (fx.stream->stream_flow_ctl.fc_max_stream_data_can_recv > fc_at_pause) {
+            break;
+        }
+    }
+    CU_ASSERT(fx.stream->stream_data_in.next_read_offset > read_point_at_pause);
+    CU_ASSERT(fx.stream->stream_flow_ctl.fc_max_stream_data_can_recv > fc_at_pause);
+
+    /*
+     * THE DELAYED-DESTROY PATH. xqc_h3_stream_close_notify() nulls
+     * h3s->stream ("stream closed, MUST NOT use it any more") and may leave
+     * the h3 stream and its request alive; an application that is still
+     * draining then calls recv_body on a request with no transport stream.
+     * Re-arming unguarded is a use-after-free.
+     */
+    xqc_h3_bb_feed_and_run(&fx, 40, 3000);
+    CU_ASSERT(fx.h3s->flags & XQC_HTTP3_STREAM_FLAG_BODY_BUF_PAUSED);
+
+    fx.h3s->stream = NULL;
+    fin = 0;
+    got = xqc_h3_request_recv_body(fx.h3s->h3r, sink, sizeof(sink), &fin);
+    CU_ASSERT(got > 0);
+    /* flag still clears -- there is simply nothing left to re-arm */
+    CU_ASSERT_FALSE(fx.h3s->flags & XQC_HTTP3_STREAM_FLAG_BODY_BUF_PAUSED);
+
+    fx.h3s->stream = fx.stream;      /* restore for teardown */
+    xqc_h3_bb_teardown(&fx);
+}
+
+
+/*
+ * TEST 4. RESET_STREAM while paused.
+ *
+ * xqc_stream_recv() is the ONLY place a terminal receive state becomes
+ * visible to the H3 layer. xqc_process_reset_stream_frame() marks the stream
+ * RESET_RECVD, destroys frames_tailq and calls xqc_stream_ready_to_read() to
+ * make that visible -- so a gate that breaks before xqc_stream_recv() and
+ * then calls xqc_stream_shutdown_read() undoes the re-arm, and with the frame
+ * list already gone nothing can ever re-arm it again. The reset is swallowed
+ * permanently and the stream never closes.
+ *
+ * Hence the terminal-state exemption, and hence this test.
+ */
+void
+xqc_test_h3_body_buf_reset_while_paused()
+{
+    xqc_h3_bb_fixture_t fx;
+    int i;
+
+    CU_ASSERT_FATAL(xqc_h3_bb_setup(&fx, 8192, 0) == XQC_TRUE);
+
+    xqc_h3_bb_feed_and_run(&fx, 40, 3000);
+    CU_ASSERT_FATAL(fx.h3s->flags & XQC_HTTP3_STREAM_FLAG_BODY_BUF_PAUSED);
+
+    /*
+     * The peer resets, leaving the stream exactly as
+     * xqc_process_reset_stream_frame() leaves it: RESET_RECVD, frames_tailq
+     * destroyed, both reassembly counters cleared, and the stream re-armed so
+     * the H3 layer will come and look. Note that the request is still over
+     * its body_buf limit and the application has drained nothing -- that is
+     * the whole point.
+     */
+    xqc_stream_recv_state_update(fx.stream, XQC_RECV_STREAM_ST_RESET_RECVD);
+    xqc_destroy_frame_list(&fx.stream->stream_data_in.frames_tailq);
+    fx.stream->stream_data_in.buffered_frame_count = 0;
+    fx.stream->stream_data_in.buffered_data_bytes = 0;
+    xqc_stream_ready_to_read(fx.stream);
+    CU_ASSERT_FATAL(fx.stream->stream_flag & XQC_STREAM_FLAG_READY_TO_READ);
+
+    /*
+     * ONE engine pass, and the test deliberately does NOT call
+     * xqc_stream_recv() itself: the entire question is whether the H3 layer
+     * reaches that call at all.
+     */
+    xqc_process_read_streams(fx.conn);
+
+    /*
+     * THE ASSERTION. xqc_stream_recv() is the only thing that turns
+     * RESET_RECVD into RESET_READ, so seeing RESET_READ is seeing the reset
+     * delivered. A gate without the terminal-state exemption breaks ahead of
+     * that call and then de-arms the stream -- and with frames_tailq already
+     * destroyed no later STREAM frame can re-arm it, so the reset is
+     * swallowed for the life of the connection and the stream never closes.
+     */
+    CU_ASSERT_EQUAL(fx.stream->stream_state_recv, XQC_RECV_STREAM_ST_RESET_READ);
+    CU_ASSERT_EQUAL(fx.conn->conn_err, 0);
+
+    /* and it was not merely late: nothing further changes it either way */
+    for (i = 0; i < 10; i++) {
+        xqc_process_read_streams(fx.conn);
+    }
+    CU_ASSERT_EQUAL(fx.stream->stream_state_recv, XQC_RECV_STREAM_ST_RESET_READ);
+
+    xqc_h3_bb_teardown(&fx);
+}
+
+
+/*
+ * TEST 5. Tiny DATA frames.
+ *
+ * The byte limit bounds payload, not metadata. One xqc_h3_stream_process_in()
+ * call appends one node per DATA frame it parses, each costing three
+ * allocations, so a peer framing DATA at one byte turns an 8 KB byte budget
+ * into thousands of nodes and tens of kilobytes of headers. The derived node
+ * bound is what stops that: 8192 / 256 = 32 nodes.
+ */
+void
+xqc_test_h3_body_buf_tiny_frames()
+{
+    xqc_h3_bb_fixture_t fx;
+    const uint64_t node_limit = 8192 / XQC_H3_BODY_BUF_MIN_BYTES_PER_NODE;
+
+    CU_ASSERT_FATAL(xqc_h3_bb_setup(&fx, 8192, 0) == XQC_TRUE);
+
+    /* 2000 one-byte DATA frames: 2 KB of payload, which never reaches the
+     * byte limit, against 2000 nodes, which passes the node limit 62 times */
+    xqc_h3_bb_feed_and_run(&fx, 2000, 1);
+
+    CU_ASSERT(fx.h3s->flags & XQC_HTTP3_STREAM_FLAG_BODY_BUF_PAUSED);
+
+    /* stopped on NODES, with the byte limit nowhere near reached */
+    CU_ASSERT(fx.h3s->h3r->body_buf_bytes < 8192);
+    CU_ASSERT(fx.h3s->h3r->body_buf_count >= node_limit);
+
+    /*
+     * The honest ceiling: one 4 KB transport read may land after the check,
+     * and the worst framing inside it is 3 bytes per DATA frame
+     * (1 type + 1 length + 1 payload), so at most 4096/3 + 1 extra nodes.
+     * Without the node bound this is unbounded in the frame count.
+     */
+    CU_ASSERT(fx.h3s->h3r->body_buf_count
+              <= node_limit + XQC_DATA_BUF_SIZE_4K / 3 + 1);
+
+    xqc_h3_bb_teardown(&fx);
+}
+
+
+/*
+ * TEST 6, not in the plan. The settings have to REACH a server connection.
+ *
+ * xqc_server_set_conn_settings() copies field by field into
+ * engine->default_conn_settings -- unlike xqc_conn_create(), which assigns
+ * the whole struct -- so a new setting that is not named there never reaches
+ * a server connection at all. Every one of the five cases above runs on a
+ * client and passes with that line missing. On this product the server is the
+ * concentrator, and the upload direction has exactly the same unbounded
+ * body_buf, so the gap would be invisible and total.
+ */
+void
+xqc_test_h3_body_buf_reaches_server()
+{
+    xqc_engine_t *engine = test_create_engine_server();
+    xqc_conn_settings_t settings;
+
+    CU_ASSERT_PTR_NOT_NULL_FATAL(engine);
+
+    memset(&settings, 0, sizeof(settings));
+    settings.max_body_buf_per_stream = 256 * 1024;
+    settings.max_body_buf_per_conn = 4 * 1024 * 1024;
+    xqc_server_set_conn_settings(engine, &settings);
+
+    CU_ASSERT_EQUAL(engine->default_conn_settings.max_body_buf_per_stream,
+                    (size_t)(256 * 1024));
+    CU_ASSERT_EQUAL(engine->default_conn_settings.max_body_buf_per_conn,
+                    (size_t)(4 * 1024 * 1024));
+
+    /* and zero still means unbounded rather than acquiring a default */
+    memset(&settings, 0, sizeof(settings));
+    xqc_server_set_conn_settings(engine, &settings);
+    CU_ASSERT_EQUAL(engine->default_conn_settings.max_body_buf_per_stream, (size_t)0);
+    CU_ASSERT_EQUAL(engine->default_conn_settings.max_body_buf_per_conn, (size_t)0);
+
+    xqc_engine_destroy(engine);
 }

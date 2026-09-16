@@ -18,6 +18,35 @@
 /* Default maximum total size of blocked buffers per connection (8 MB) */
 #define XQC_H3_CONN_MAX_BLOCKED_BUF_SIZE_DEFAULT (8 * 1024 * 1024)
 
+/*
+ * Resume reading a paused request once its buffered body has drained to a
+ * quarter of the configured limit. The 4:1 ratio is anti-flap, not a tuning
+ * knob: resuming AT the limit would add a pause/resume cycle -- and with it a
+ * MAX_STREAM_DATA and a window re-open -- to every engine tick of a download
+ * that is merely keeping up rather than falling behind.
+ *
+ * UNMEASURED on this path. The ratio is borrowed from a downstream consumer's
+ * own TCP-lane high/low water pair (262144 / 65536), which has the same shape
+ * and the same stated rationale; nothing here has been profiled against a real
+ * body_buf yet.
+ */
+#define XQC_H3_BODY_BUF_LOW_WATER(limit)    ((limit) / 4)
+
+/*
+ * Density assumed when deriving a NODE bound from the byte limit. The byte
+ * limit alone bounds payload, not metadata: one xqc_h3_stream_process_in()
+ * call appends one xqc_var_buf_t per DATA frame it parses, and
+ *
+ *     len = xqc_min(frame.len - frame.consumed_len, data_len - processed)
+ *
+ * means a peer framing DATA at 3 bytes each yields ~1365 appends out of a
+ * single 4 KB read. Each node costs three allocations (xqc_var_buf_create
+ * mallocs the struct and the payload separately, plus one xqc_list_buf_t), so
+ * an attacker could hold orders of magnitude more memory than the byte limit
+ * names. 256 B/node is the same density the transport reassembly gate uses.
+ */
+#define XQC_H3_BODY_BUF_MIN_BYTES_PER_NODE  256
+
 typedef struct xqc_h3_conn_s    xqc_h3_conn_t;
 typedef struct xqc_h3_stream_s  xqc_h3_stream_t;
 
@@ -81,6 +110,13 @@ typedef enum {
     XQC_HTTP3_STREAM_FLAG_ACTIVELY_CLOSED = 0x1000,
     /* FIN was sent and no data will be sent any more */
     XQC_HTTP3_STREAM_FLAG_FIN_SENT = 0x2000,
+    /* XQC_HTTP3_STREAM_FLAG_BODY_BUF_PAUSED indicates that reading from the
+       transport stream is suspended because the application has not drained
+       body_buf. Cleared, and the stream re-armed, in
+       xqc_h3_request_recv_body(). 0x4000 because 0x1000 and 0x2000 are taken:
+       reusing 0x1000 would make a paused stream read as ACTIVELY_CLOSED and
+       take the wrong branch of xqc_h3_stream_close_notify(). */
+    XQC_HTTP3_STREAM_FLAG_BODY_BUF_PAUSED = 0x4000,
 } xqc_h3_stream_flag;
 
 typedef struct xqc_h3_stream_pctx_s {

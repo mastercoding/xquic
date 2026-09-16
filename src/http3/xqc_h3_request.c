@@ -119,6 +119,22 @@ xqc_h3_request_destroy(xqc_h3_request_t *h3_request)
         xqc_h3_headers_free(&h3_request->h3_header[i]);
     }
 
+    /*
+     * Hand the residual back to the connection counter BEFORE the list goes.
+     * A request destroyed while paused -- reset by the peer, connection
+     * closing, application abandoning the download -- otherwise leaves its
+     * bytes charged to total_body_buf_size forever, and after enough of them
+     * every later request on that connection pauses on arrival and the
+     * connection wedges. This is the only other place body_buf nodes are
+     * freed; xqc_h3_request_recv_body() reconciles the rest.
+     */
+    if (h3_request->body_buf_bytes > 0 && h3s != NULL && h3s->h3c != NULL) {
+        h3s->h3c->total_body_buf_size =
+            (h3s->h3c->total_body_buf_size >= h3_request->body_buf_bytes)
+                ? h3s->h3c->total_body_buf_size - h3_request->body_buf_bytes
+                : 0;
+        h3_request->body_buf_bytes = 0;
+    }
     xqc_list_buf_list_free(&h3_request->body_buf);
     xqc_free(h3_request);
 }
@@ -183,6 +199,7 @@ xqc_h3_request_create_inner(xqc_h3_conn_t *h3_conn, xqc_h3_stream_t *h3_stream,
 
     xqc_init_list_head(&h3_request->body_buf);
     h3_request->body_buf_count = 0;
+    h3_request->body_buf_bytes = 0;
 
     xqc_h3_request_init_callbacks(h3_conn, h3_request);
 
@@ -754,6 +771,98 @@ xqc_h3_request_recv_headers(xqc_h3_request_t *h3_request, uint8_t *fin)
     return NULL;
 }
 
+/*
+ * Give `bytes` back to the per-request and per-connection body_buf counters.
+ * Saturating rather than wrapping: these are size_t, and an underflow here
+ * would read as an enormous occupancy and wedge every stream on the
+ * connection until it closed.
+ */
+static void
+xqc_h3_request_body_buf_release(xqc_h3_request_t *h3_request, size_t bytes)
+{
+    xqc_h3_stream_t *h3s = h3_request->h3_stream;
+
+    if (bytes == 0) {
+        return;
+    }
+
+    h3_request->body_buf_bytes = (h3_request->body_buf_bytes >= bytes)
+                                     ? h3_request->body_buf_bytes - bytes
+                                     : 0;
+
+    if (h3s != NULL && h3s->h3c != NULL) {
+        h3s->h3c->total_body_buf_size = (h3s->h3c->total_body_buf_size >= bytes)
+                                            ? h3s->h3c->total_body_buf_size - bytes
+                                            : 0;
+    }
+}
+
+
+/*
+ * Un-pause a request whose application has drained far enough, and re-arm the
+ * transport stream so the engine reads again.
+ */
+static void
+xqc_h3_request_body_buf_resume(xqc_h3_request_t *h3_request)
+{
+    xqc_h3_stream_t *h3s = h3_request->h3_stream;
+    xqc_h3_conn_t   *h3c;
+    size_t           limit;
+
+    if (h3s == NULL || !(h3s->flags & XQC_HTTP3_STREAM_FLAG_BODY_BUF_PAUSED)) {
+        return;
+    }
+
+    h3c = h3s->h3c;
+    if (h3c == NULL) {
+        return;
+    }
+
+    /* every arm that can pause must fall to its low watermark before we
+     * resume, or a small drain would reopen the window straight back into the
+     * bound it just left. */
+    limit = h3c->max_body_buf_per_stream;
+    if (limit > 0) {
+        uint64_t node_limit = (uint64_t)(limit / XQC_H3_BODY_BUF_MIN_BYTES_PER_NODE);
+        if (node_limit == 0) {
+            node_limit = 1;
+        }
+        if (h3_request->body_buf_bytes > XQC_H3_BODY_BUF_LOW_WATER(limit)) {
+            return;
+        }
+        if (h3_request->body_buf_count > XQC_H3_BODY_BUF_LOW_WATER(node_limit)) {
+            return;
+        }
+    }
+
+    if (h3c->max_body_buf_per_conn > 0
+        && h3c->total_body_buf_size
+               > XQC_H3_BODY_BUF_LOW_WATER(h3c->max_body_buf_per_conn))
+    {
+        return;
+    }
+
+    h3s->flags &= ~XQC_HTTP3_STREAM_FLAG_BODY_BUF_PAUSED;
+
+    /*
+     * MUST be guarded. xqc_h3_stream_close_notify() sets h3s->stream = NULL
+     * with the comment "stream closed, MUST NOT use it any more", and then
+     * DELAYS destroying h3s on the QPACK-blocked branch -- leaving a live
+     * request whose application is still draining body_buf after the transport
+     * stream is gone. Unguarded this is a use-after-free on a path real
+     * consumers take. Clearing the flag without re-arming is correct there:
+     * there is no longer anything to read.
+     */
+    if (h3s->stream != NULL) {
+        xqc_stream_ready_to_read(h3s->stream);
+        xqc_log(h3c->log, XQC_LOG_DEBUG,
+                "|body_buf resumed|stream_id:%ui|bytes:%uz|conn_total:%uz|",
+                h3s->stream_id, h3_request->body_buf_bytes,
+                h3c->total_body_buf_size);
+    }
+}
+
+
 ssize_t
 xqc_h3_request_recv_body(xqc_h3_request_t *h3_request, unsigned char *recv_buf,
                          size_t recv_buf_size, uint8_t *fin)
@@ -777,6 +886,10 @@ xqc_h3_request_recv_body(xqc_h3_request_t *h3_request, unsigned char *recv_buf,
         if (buf->data_len - buf->consumed_len <= recv_buf_size - n_recv) {
             memcpy(recv_buf + n_recv, buf->data + buf->consumed_len,
                    buf->data_len - buf->consumed_len);
+            /* released BEFORE n_recv moves, and from the per-branch quantity
+             * rather than from n_recv, so the two branches stay independent */
+            xqc_h3_request_body_buf_release(h3_request,
+                                            buf->data_len - buf->consumed_len);
             n_recv += buf->data_len - buf->consumed_len;
             h3_request->body_buf_count--;
             xqc_list_buf_free(list_buf);
@@ -785,10 +898,19 @@ xqc_h3_request_recv_body(xqc_h3_request_t *h3_request, unsigned char *recv_buf,
             memcpy(recv_buf + n_recv, buf->data + buf->consumed_len,
                    recv_buf_size - n_recv);
             buf->consumed_len += recv_buf_size - n_recv;
+            /* MUST be computed before the assignment below: once n_recv is
+             * recv_buf_size the number of bytes this iteration actually took
+             * (recv_buf_size - n_recv) is no longer recoverable, and releasing
+             * n_recv here instead would over-release by everything the earlier
+             * iterations had already released. */
+            xqc_h3_request_body_buf_release(h3_request, recv_buf_size - n_recv);
             n_recv = recv_buf_size;
             break;
         }
     }
+
+    /* the application has taken bytes out; the stream may be readable again */
+    xqc_h3_request_body_buf_resume(h3_request);
 
     /* all data in body buf was read, reset XQC_REQ_NOTIFY_READ_BODY */
     if (xqc_list_empty(&h3_request->body_buf)) {

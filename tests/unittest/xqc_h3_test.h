@@ -63,4 +63,14 @@ void xqc_test_h3_blocked_stream_limit_uses_local();
 /* ALIBABA-2026-42073004: SETTINGS frame size limit */
 void xqc_test_h3_settings_frame_size_limit();
 
+/* conn_settings.max_body_buf_per_stream / _per_conn: the body_buf bound */
+void xqc_test_h3_body_buf_flag_bit_is_free();
+void xqc_test_h3_body_buf_no_spin();
+void xqc_test_h3_body_buf_second_stream_unaffected();
+void xqc_test_h3_body_buf_backpressure();
+void xqc_test_h3_body_buf_resume();
+void xqc_test_h3_body_buf_reset_while_paused();
+void xqc_test_h3_body_buf_tiny_frames();
+void xqc_test_h3_body_buf_reaches_server();
+
 #endif // XQUIC_XQC_H3_TEST_H
