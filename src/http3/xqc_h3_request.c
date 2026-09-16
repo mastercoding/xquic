@@ -120,21 +120,13 @@ xqc_h3_request_destroy(xqc_h3_request_t *h3_request)
     }
 
     /*
-     * Hand the residual back to the connection counter BEFORE the list goes.
-     * A request destroyed while paused -- reset by the peer, connection
-     * closing, application abandoning the download -- otherwise leaves its
-     * bytes charged to total_body_buf_size forever, and after enough of them
-     * every later request on that connection pauses on arrival and the
-     * connection wedges. This is the only other place body_buf nodes are
-     * freed; xqc_h3_request_recv_body() reconciles the rest.
+     * body_buf_bytes dies with the request and is charged nowhere else, so
+     * there is nothing to hand back here. That is a consequence of the bound
+     * being per stream: a connection-wide counter would have to be reconciled
+     * on this path, and getting it wrong would leave bytes charged forever and
+     * wedge every later request on the connection.
      */
-    if (h3_request->body_buf_bytes > 0 && h3s != NULL && h3s->h3c != NULL) {
-        h3s->h3c->total_body_buf_size =
-            (h3s->h3c->total_body_buf_size >= h3_request->body_buf_bytes)
-                ? h3s->h3c->total_body_buf_size - h3_request->body_buf_bytes
-                : 0;
-        h3_request->body_buf_bytes = 0;
-    }
+    h3_request->body_buf_bytes = 0;
     xqc_list_buf_list_free(&h3_request->body_buf);
     xqc_free(h3_request);
 }
@@ -772,16 +764,13 @@ xqc_h3_request_recv_headers(xqc_h3_request_t *h3_request, uint8_t *fin)
 }
 
 /*
- * Give `bytes` back to the per-request and per-connection body_buf counters.
- * Saturating rather than wrapping: these are size_t, and an underflow here
- * would read as an enormous occupancy and wedge every stream on the
- * connection until it closed.
+ * Give `bytes` back to this request's body_buf counter. Saturating rather than
+ * wrapping: it is a size_t, and an underflow here would read as an enormous
+ * occupancy and suspend the stream until it closed.
  */
 static void
 xqc_h3_request_body_buf_release(xqc_h3_request_t *h3_request, size_t bytes)
 {
-    xqc_h3_stream_t *h3s = h3_request->h3_stream;
-
     if (bytes == 0) {
         return;
     }
@@ -789,18 +778,21 @@ xqc_h3_request_body_buf_release(xqc_h3_request_t *h3_request, size_t bytes)
     h3_request->body_buf_bytes = (h3_request->body_buf_bytes >= bytes)
                                      ? h3_request->body_buf_bytes - bytes
                                      : 0;
-
-    if (h3s != NULL && h3s->h3c != NULL) {
-        h3s->h3c->total_body_buf_size = (h3s->h3c->total_body_buf_size >= bytes)
-                                            ? h3s->h3c->total_body_buf_size - bytes
-                                            : 0;
-    }
 }
 
 
 /*
  * Un-pause a request whose application has drained far enough, and re-arm the
  * transport stream so the engine reads again.
+ *
+ * EVERY QUANTITY READ HERE IS THIS REQUEST'S OWN, and it has to stay that way.
+ * This function is the only place XQC_HTTP3_STREAM_FLAG_BODY_BUF_PAUSED is
+ * cleared, and it runs from exactly one call site: this request's own
+ * xqc_h3_request_recv_body(). A condition on anything the caller cannot change
+ * by draining -- a connection total, another stream's state -- is a condition
+ * the caller can satisfy only by accident, and while it is unsatisfied the
+ * stream stays de-armed with no other event able to re-arm it. The mirror
+ * image of the same rule in xqc_h3_stream_body_buf_should_pause().
  */
 static void
 xqc_h3_request_body_buf_resume(xqc_h3_request_t *h3_request)
@@ -818,7 +810,7 @@ xqc_h3_request_body_buf_resume(xqc_h3_request_t *h3_request)
         return;
     }
 
-    /* every arm that can pause must fall to its low watermark before we
+    /* both arms that can pause must fall to their low watermark before we
      * resume, or a small drain would reopen the window straight back into the
      * bound it just left. */
     limit = h3c->max_body_buf_per_stream;
@@ -835,13 +827,6 @@ xqc_h3_request_body_buf_resume(xqc_h3_request_t *h3_request)
         }
     }
 
-    if (h3c->max_body_buf_per_conn > 0
-        && h3c->total_body_buf_size
-               > XQC_H3_BODY_BUF_LOW_WATER(h3c->max_body_buf_per_conn))
-    {
-        return;
-    }
-
     h3s->flags &= ~XQC_HTTP3_STREAM_FLAG_BODY_BUF_PAUSED;
 
     /*
@@ -856,9 +841,9 @@ xqc_h3_request_body_buf_resume(xqc_h3_request_t *h3_request)
     if (h3s->stream != NULL) {
         xqc_stream_ready_to_read(h3s->stream);
         xqc_log(h3c->log, XQC_LOG_DEBUG,
-                "|body_buf resumed|stream_id:%ui|bytes:%uz|conn_total:%uz|",
+                "|body_buf resumed|stream_id:%ui|bytes:%uz|nodes:%ui|",
                 h3s->stream_id, h3_request->body_buf_bytes,
-                h3c->total_body_buf_size);
+                h3_request->body_buf_count);
     }
 }
 

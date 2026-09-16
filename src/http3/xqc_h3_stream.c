@@ -1143,7 +1143,6 @@ xqc_h3_stream_process_request(xqc_h3_stream_t *h3s, unsigned char *data, size_t 
                 }
                 h3s->h3r->body_buf_count++;
                 h3s->h3r->body_buf_bytes += len;
-                h3s->h3c->total_body_buf_size += len;
 
                 processed += len;
                 pctx->frame.consumed_len += len;
@@ -1900,6 +1899,21 @@ xqc_h3_body_buf_node_limit(size_t byte_limit)
  * no negotiation, no way to deadlock on withheld credit, because
  * xqc_stream_recv() does not return early on EAGAIN and so cannot lose a
  * window update it was about to send.
+ *
+ * THE ONLY INPUTS ARE THIS STREAM'S OWN COUNTERS, and that is the whole
+ * safety argument for the mechanism. Suspending a stream also de-arms it
+ * (xqc_stream_shutdown_read() in the caller), so the ONLY things that can
+ * bring it back are an arriving STREAM frame and
+ * xqc_h3_request_body_buf_resume(), which runs from this request's own
+ * xqc_h3_request_recv_body(). Pause on any quantity this stream's application
+ * cannot lower by itself and there is a state with no exit: a peer that has
+ * already sent everything sends no further frame, and an application with an
+ * empty body_buf has no reason to call recv_body. An earlier revision paused
+ * on a connection-wide total and reached exactly that state -- a stream
+ * suspended while holding zero bytes, its delivered bytes unread for the life
+ * of the connection, no error raised. If a connection-wide bound is ever
+ * wanted here, it needs a connection-wide RESUME first, and the resume is the
+ * hard half.
  */
 static xqc_bool_t
 xqc_h3_stream_body_buf_should_pause(xqc_h3_stream_t *h3s)
@@ -1959,12 +1973,6 @@ xqc_h3_stream_body_buf_should_pause(xqc_h3_stream_t *h3s)
         }
     }
 
-    if (h3c->max_body_buf_per_conn > 0
-        && h3c->total_body_buf_size >= h3c->max_body_buf_per_conn)
-    {
-        return XQC_TRUE;
-    }
-
     return XQC_FALSE;
 }
 
@@ -2001,9 +2009,9 @@ xqc_h3_stream_process_data(xqc_stream_t *stream, xqc_h3_stream_t *h3s, xqc_bool_
             h3s->flags |= XQC_HTTP3_STREAM_FLAG_BODY_BUF_PAUSED;
             xqc_stream_shutdown_read(stream);
             xqc_log(h3c->log, XQC_LOG_DEBUG,
-                    "|body_buf paused|stream_id:%ui|bytes:%uz|nodes:%ui|conn_total:%uz|",
+                    "|body_buf paused|stream_id:%ui|bytes:%uz|nodes:%ui|limit:%uz|",
                     h3s->stream_id, h3s->h3r->body_buf_bytes,
-                    h3s->h3r->body_buf_count, h3c->total_body_buf_size);
+                    h3s->h3r->body_buf_count, h3c->max_body_buf_per_stream);
             break;
         }
 
