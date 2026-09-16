@@ -74,5 +74,7 @@ void xqc_test_h3_body_buf_tiny_frames();
 void xqc_test_h3_body_buf_reaches_server();
 void xqc_test_h3_body_buf_conn_arm_orphan();
 void xqc_test_h3_body_buf_pause_is_per_stream_only();
+void xqc_test_h3_blocked_buf_limit_closes_the_connection();
+void xqc_test_h3_blocked_buf_default_is_asymmetric();
 
 #endif // XQUIC_XQC_H3_TEST_H

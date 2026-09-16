@@ -3203,3 +3203,114 @@ xqc_test_h3_body_buf_pause_is_per_stream_only()
     }
     xqc_h3_bb_teardown(&fx);
 }
+
+
+/*
+ * TEST 9. max_blocked_buf_per_stream IS NOT BACKPRESSURE. IT CLOSES THE
+ * CONNECTION.
+ *
+ * This test exists because nothing else says so. The field's own doc used to
+ * read like the body_buf pair beside it -- a limit, a default, a number of
+ * bytes -- and a reader reasonably assumed a limit on a buffer stops filling
+ * the buffer. It does not: both enforcement sites call
+ * XQC_H3_CONN_ERR(h3c, H3_EXCESSIVE_LOAD, ...), which sets conn_err on the
+ * TRANSPORT connection and raises XQC_CONN_FLAG_ERROR. On a product that
+ * carries every TCP flow over one HTTP/3 connection, that is not one request
+ * failing -- it is the tunnel going down and every flow on it dying.
+ *
+ * The value an operator picks is therefore the amount of QPACK
+ * decode-blocked data that is allowed to arrive before the connection is torn
+ * down, and it is a property of the PEER's encoder, the path's reordering and
+ * the transfer rate, not of anything the local side controls.
+ *
+ * It is also the positive control for the measurement that sized the setting
+ * for one downstream deployment: with this limit at 1 byte on both ends, that
+ * deployment's own rig carried 3.5 GB over 120 s across five multiplexed
+ * flows with zero connection closes, i.e. the decode-blocked path was never
+ * entered at all on its traffic. A run that proves nothing happened is only
+ * worth something if the detector works, and this is the detector.
+ *
+ * Deliberately NOT converted to a pause, and the reason is worth recording:
+ * a stream suspended on body_buf waits for its own APPLICATION, which lives
+ * outside the connection, while a stream suspended on blocked_buf waits for
+ * QPACK encoder instructions that have to arrive through the same
+ * connection-level receive window the suspended stream is holding shut. That
+ * is a self-deadlock shape the body_buf pause does not have, and it cannot be
+ * ruled out without an argument about the connection window that this library
+ * has no way to make for its callers.
+ */
+void
+xqc_test_h3_blocked_buf_limit_closes_the_connection()
+{
+    xqc_h3_bb_fixture_t fx;
+
+    /* no body_buf bound at all: this is the other queue entirely */
+    CU_ASSERT_FATAL(xqc_h3_bb_setup(&fx, 0) == XQC_TRUE);
+
+    /* one byte, so the very first decode-blocked chunk is over the line */
+    fx.h3c->max_blocked_buf_per_stream = 1;
+    fx.h3c->max_blocked_buf_per_conn = 0;
+
+    /* stand in for a HEADERS section that referenced a dynamic-table entry
+     * the decoder has not received yet: everything after it buffers */
+    fx.h3s->flags |= XQC_HTTP3_STREAM_FLAG_QPACK_DECODE_BLOCKED;
+
+    CU_ASSERT_EQUAL_FATAL(fx.conn->conn_err, 0);
+
+    xqc_h3_bb_feed_and_run(&fx, 40, 3000);
+
+    printf("\n  [blocked-buf] limit=1 blocked_buf_size=%zu conn_err=0x%x "
+           "(H3_EXCESSIVE_LOAD=0x%x) conn_flag_error=%d\n",
+           fx.h3s->blocked_buf_size, (unsigned)fx.conn->conn_err,
+           (unsigned)H3_EXCESSIVE_LOAD,
+           (fx.conn->conn_flag & XQC_CONN_FLAG_ERROR) ? 1 : 0);
+
+    /* the connection, not the stream */
+    CU_ASSERT_EQUAL(fx.conn->conn_err, H3_EXCESSIVE_LOAD);
+    CU_ASSERT(fx.conn->conn_flag & XQC_CONN_FLAG_ERROR);
+
+    xqc_h3_bb_teardown(&fx);
+}
+
+
+/*
+ * TEST 10. ...and zero does not mean the same thing on both sides.
+ *
+ * xquic substitutes its internal 1 MB / 8 MB defaults for the blocked-buf
+ * pair ONLY in xqc_server_set_conn_settings(). The client path
+ * (xqc_conn_create) assigns the caller's whole settings struct and defaults
+ * nothing. So an application that leaves both at 0 gets a bounded,
+ * connection-fatal limit on its SERVERS and an unbounded buffer on its
+ * CLIENTS -- opposite failure modes from one unset field, which is worth a
+ * test rather than a paragraph.
+ *
+ * Contrast max_body_buf_per_stream in the same call: 0 stays 0, because a
+ * bound that pauses reading is only safe when the reassembly cap sits above
+ * the window's node equivalent, which xquic cannot see.
+ */
+void
+xqc_test_h3_blocked_buf_default_is_asymmetric()
+{
+    xqc_engine_t *engine = test_create_engine_server();
+    xqc_conn_settings_t settings;
+
+    CU_ASSERT_PTR_NOT_NULL_FATAL(engine);
+
+    memset(&settings, 0, sizeof(settings));
+    xqc_server_set_conn_settings(engine, &settings);
+
+    printf("\n  [blocked-buf] server default from 0: per_stream=%zu per_conn=%zu; "
+           "body_buf per_stream=%zu\n",
+           engine->default_conn_settings.max_blocked_buf_per_stream,
+           engine->default_conn_settings.max_blocked_buf_per_conn,
+           engine->default_conn_settings.max_body_buf_per_stream);
+
+    CU_ASSERT_EQUAL(engine->default_conn_settings.max_blocked_buf_per_stream,
+                    (size_t)XQC_H3_STREAM_MAX_BLOCKED_BUF_SIZE_DEFAULT);
+    CU_ASSERT_EQUAL(engine->default_conn_settings.max_blocked_buf_per_conn,
+                    (size_t)XQC_H3_CONN_MAX_BLOCKED_BUF_SIZE_DEFAULT);
+    /* the body_buf bound does NOT acquire a default from the same call */
+    CU_ASSERT_EQUAL(engine->default_conn_settings.max_body_buf_per_stream, (size_t)0);
+
+    xqc_engine_destroy(engine);
+}
