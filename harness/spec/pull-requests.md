@@ -21,7 +21,9 @@ authoritative contribution contract. Check every requirement before review:
   feature, `fix/` for a bug fix, `perf/` for a performance optimization or
   other enhancement, or `doc/` for documentation;
 - every commit header follows `[<type>]: <subject>` with an allowed `+`, `-`,
-  `=`, or `~` type;
+  `=`, or `~` type; on `mqvpn-*` branches a conventional header
+  (`type: subject` or `type(scope): subject`) is accepted alongside it (a
+  fork-local exception to CONTRIBUTING.md);
 - the contributor has signed or will complete the CLA before merge;
 - the change follows the Nginx-derived XQUIC code style;
 - the full test suite and sufficient relevant tests pass;
