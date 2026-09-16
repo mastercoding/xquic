@@ -752,3 +752,94 @@ xqc_test_stream_frame_prefix_respects_hard_cap()
 
     xqc_engine_destroy(conn->engine);
 }
+
+
+/**
+ * THE RESIDUAL STALL PATH. Plan section 2, step 7.
+ *
+ * The two-tier cap makes the receive WINDOW the binding constraint only when
+ * the average frame is large enough. The density tier admits any stream
+ * averaging at least XQC_MIN_STREAM_BUFFERED_BYTES_PER_FRAME (256 B) per
+ * node, so for an average frame anywhere in [256, 512) bytes the density tier
+ * never fires and only the hard ceiling applies. At 300 B that is
+ *
+ *     XQC_MAX_STREAM_FRAME_BUFFERED_COUNT_HARD * 300
+ *         = 32768 * 300 = 9,830,400 bytes
+ *
+ * against a 16 MiB (16,777,216 byte) window: the cap trips at 58.6% of the
+ * window, and the peer sees repeated whole-packet unacked drops instead of
+ * flow-control backpressure. That is the silent stall, WITH the tiers in
+ * place. The measured median frame on the hybrid lane is 1379 B, where
+ * 32768 * 1379 = 45 MB and the window does bind first -- this test is about
+ * the band underneath that, which nothing else covers.
+ *
+ * THE INVARIANT, asserted directly: a frame whose end offset is still inside
+ * the advertised stream receive window must never be refused for reassembly
+ * resource reasons. Flow control is the brake; the reassembly cap is a
+ * resource mitigation that has to sit behind it.
+ *
+ * (Asserting TRA_FLOW_CONTROL_ERROR instead would prove only error ORDERING
+ * for a misbehaving peer that overruns its window. A conforming peer never
+ * reaches that check, so such a test passes against a build with the
+ * ordering right and this arithmetic wrong.)
+ *
+ * THIS TEST IS EXPECTED TO FAIL against the cap tiers alone. It is an
+ * instrument, not a regression guard: its result decides whether
+ * conn_settings.max_recv_window is optional belt-and-braces or a MANDATORY
+ * setting for Fastest mode. Do NOT relax it to make the suite green. If it
+ * fails, the answers are to set max_recv_window below
+ * hard_cap * observed_frame_size, or to raise hard_cap -- and to record which
+ * was chosen and on what measurement.
+ */
+void
+xqc_test_stream_frame_window_binds_at_300b()
+{
+    xqc_connection_t *conn = test_engine_connect();
+    CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
+
+    /* The tree's default per-stream window, and a connection limit far above
+     * it so only the stream window is in play. */
+    const uint64_t window = XQC_MAX_RECV_WINDOW;
+    xqc_stream_t *stream = test_stream_with_fc(conn, window, window * 4);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(stream);
+
+    const unsigned len = 300;
+    /* Leave [0, len) as the leftmost hole so merged_offset_end stays 0:
+     * nothing merges, no frame qualifies as a prefix-extender, and every
+     * admitted frame is a real buffered node. */
+    uint64_t offset = len;
+    uint64_t admitted = 0;
+    uint64_t reject_offset = 0;
+
+    while (offset + len <= window) {
+        xqc_stream_frame_t *f = test_mk_frame(offset, len);
+        CU_ASSERT_PTR_NOT_NULL_FATAL(f);
+
+        if (xqc_insert_stream_frame(conn, stream, f) != XQC_OK) {
+            reject_offset = offset;
+            xqc_destroy_stream_frame(f);
+            break;
+        }
+        admitted++;
+        offset += len;
+    }
+
+    /* Nothing inside the advertised window may be refused. */
+    CU_ASSERT_EQUAL(reject_offset, 0);
+
+    /* The same statement from the other side, so a failure log names the
+     * quantity that is wrong: absorbing a full window of 300 B frames needs
+     * more nodes than the hard ceiling allows. */
+    CU_ASSERT(admitted > (uint64_t)XQC_MAX_STREAM_FRAME_BUFFERED_COUNT_HARD);
+    CU_ASSERT(admitted >= window / len - 1);
+    CU_ASSERT_EQUAL(stream->stream_data_in.buffered_frame_count, admitted);
+
+    /* The density tier is NOT what rejects here: 300 B per node is above the
+     * 256 B minimum, so buffered_bytes + len >= count_after * 256 always
+     * holds. If this ever fails the analysis above has changed. */
+    CU_ASSERT(stream->stream_data_in.buffered_data_bytes + len
+              >= (stream->stream_data_in.buffered_frame_count + 1)
+                     * (uint64_t)XQC_MIN_STREAM_BUFFERED_BYTES_PER_FRAME);
+
+    xqc_engine_destroy(conn->engine);
+}

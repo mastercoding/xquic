@@ -16,6 +16,8 @@ void  xqc_test_stream_frame_cap_liveness_real();
 void  xqc_test_stream_frame_dense_buffer_budget();
 void  xqc_test_stream_frame_dense_prefix_liveness();
 void  xqc_test_stream_frame_prefix_respects_hard_cap();
+/* plan step 7: the residual-stall instrument. Expected to FAIL at step 1. */
+void  xqc_test_stream_frame_window_binds_at_300b();
 void  xqc_test_stream_frame_fin_repair_skips_discarded();
 void  xqc_test_stream_frame_cap_setting();
 
