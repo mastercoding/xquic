@@ -18,6 +18,10 @@ void  xqc_test_stream_frame_dense_prefix_liveness();
 void  xqc_test_stream_frame_prefix_respects_hard_cap();
 /* plan step 7: the residual-stall instrument. Expected to FAIL at step 1. */
 void  xqc_test_stream_frame_window_binds_at_300b();
+
+/* RFC 9000 s3.3: STOP_SENDING must drop the stream's queued STREAM packets */
+void  xqc_test_stop_sending_drops_queued_stream_packets();
+void  xqc_test_stop_sending_spares_other_streams();
 void  xqc_test_stream_frame_fin_repair_skips_discarded();
 void  xqc_test_stream_frame_cap_setting();
 

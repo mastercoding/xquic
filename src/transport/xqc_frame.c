@@ -1619,8 +1619,26 @@ xqc_process_stop_sending_frame(xqc_connection_t *conn, xqc_packet_in_t *packet_i
      * An endpoint that receives a STOP_SENDING frame
      * MUST send a RESET_STREAM frame if the stream is in the Ready or Send
      * state.
+     *
+     * RFC 9000 Section 3.3: "A sender MUST NOT send any of these frames
+     * [STREAM, STREAM_DATA_BLOCKED] from a terminal state ('Reset Recvd' or
+     * 'Data Recvd')", and an endpoint that sends RESET_STREAM enters
+     * 'Reset Sent' -- so the queued STREAM frames for this stream must go
+     * with it. Retransmitting data the peer has just told us to stop sending
+     * wastes the congestion window on bytes that will be discarded.
+     *
+     * Both sibling paths already do this: the local reset
+     * (xqc_stream_close_with_error) and the RESET_STREAM-receive path
+     * (xqc_process_reset_stream_frame, a few lines above). This one did not.
+     *
+     * The drop is safe for a connection multiplexing several streams over
+     * one packet: xqc_send_ctl_stream_frame_can_drop() discards a packet only
+     * when its frame types lie inside {STREAM, ACK, ACK_MP, SID} AND every
+     * used po_stream_frames[] entry names this same stream_id, so a packet
+     * carrying another stream's bytes is left alone.
      */
     if (stream->stream_state_send < XQC_SEND_STREAM_ST_RESET_SENT) {
+        xqc_send_queue_drop_stream_frame_packets(conn, stream_id);
         xqc_write_reset_stream_to_packet(conn, stream, H3_REQUEST_CANCELLED,
                                          stream->stream_send_offset);
     }

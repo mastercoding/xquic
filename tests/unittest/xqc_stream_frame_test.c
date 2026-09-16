@@ -10,6 +10,8 @@
 #include "src/transport/xqc_stream.h"
 #include "src/transport/xqc_defs.h"
 #include "src/transport/xqc_packet_in.h"
+#include "src/transport/xqc_packet_out.h"
+#include "src/transport/xqc_send_queue.h"
 #include <xquic/xqc_errno.h>
 #include "xqc_common_test.h"
 
@@ -840,6 +842,251 @@ xqc_test_stream_frame_window_binds_at_300b()
     CU_ASSERT(stream->stream_data_in.buffered_data_bytes + len
               >= (stream->stream_data_in.buffered_frame_count + 1)
                      * (uint64_t)XQC_MIN_STREAM_BUFFERED_BYTES_PER_FRAME);
+
+    xqc_engine_destroy(conn->engine);
+}
+
+
+/* ======================================================================
+ * PLAN SECTION 2, STEP 6 -- the STOP_SENDING send-queue drop.
+ *
+ * Three code paths write RESET_STREAM. Two of them drop the stream's queued
+ * STREAM packets first; the STOP_SENDING path does not. A peer that has told
+ * us to stop sending therefore keeps receiving everything already queued for
+ * that stream, retransmitted out of the congestion window, and discarded on
+ * arrival.
+ * ====================================================================== */
+
+/* every send-queue list that xqc_send_queue_drop_stream_frame_packets()
+ * walks and that a freshly written STREAM packet can be sitting on */
+static int
+test_ss_count_stream_packets(xqc_connection_t *conn, xqc_stream_id_t sid)
+{
+    xqc_send_queue_t *sq = conn->conn_send_queue;
+    xqc_list_head_t *queues[4];
+    xqc_list_head_t *pos, *next;
+    xqc_packet_out_t *po;
+    int n = 0;
+    int q, i;
+
+    queues[0] = &sq->sndq_send_packets;
+    queues[1] = &sq->sndq_unacked_packets[XQC_PNS_APP_DATA];
+    queues[2] = &sq->sndq_lost_packets;
+    queues[3] = &sq->sndq_pto_probe_packets;
+
+    for (q = 0; q < 4; q++) {
+        xqc_list_for_each_safe(pos, next, queues[q]) {
+            po = xqc_list_entry(pos, xqc_packet_out_t, po_list);
+            if (!(po->po_frame_types & XQC_FRAME_BIT_STREAM)) {
+                continue;
+            }
+            for (i = 0; i < XQC_MAX_STREAM_FRAME_IN_PO; i++) {
+                if (po->po_stream_frames[i].ps_is_used == 0) {
+                    break;
+                }
+                if (po->po_stream_frames[i].ps_stream_id == sid
+                    && !po->po_stream_frames[i].ps_is_reset)
+                {
+                    n++;
+                    break;
+                }
+            }
+        }
+    }
+    return n;
+}
+
+static int
+test_ss_count_reset_packets(xqc_connection_t *conn, xqc_stream_id_t sid)
+{
+    xqc_send_queue_t *sq = conn->conn_send_queue;
+    xqc_list_head_t *queues[4];
+    xqc_list_head_t *pos, *next;
+    xqc_packet_out_t *po;
+    int n = 0;
+    int q, i;
+
+    queues[0] = &sq->sndq_send_packets;
+    queues[1] = &sq->sndq_unacked_packets[XQC_PNS_APP_DATA];
+    queues[2] = &sq->sndq_lost_packets;
+    queues[3] = &sq->sndq_pto_probe_packets;
+
+    for (q = 0; q < 4; q++) {
+        xqc_list_for_each_safe(pos, next, queues[q]) {
+            po = xqc_list_entry(pos, xqc_packet_out_t, po_list);
+            if (!(po->po_frame_types & XQC_FRAME_BIT_RESET_STREAM)) {
+                continue;
+            }
+            for (i = 0; i < XQC_MAX_STREAM_FRAME_IN_PO; i++) {
+                if (po->po_stream_frames[i].ps_is_used == 0) {
+                    break;
+                }
+                if (po->po_stream_frames[i].ps_stream_id == sid
+                    && po->po_stream_frames[i].ps_is_reset)
+                {
+                    n++;
+                    break;
+                }
+            }
+        }
+    }
+    return n;
+}
+
+/* one STOP_SENDING frame: type 0x05, varint stream id, varint error code.
+ * Both values are kept below 64 so each varint is a single byte. */
+static size_t
+test_ss_put_stop_sending(unsigned char *out, uint64_t stream_id, uint64_t err)
+{
+    out[0] = 0x05;
+    out[1] = (unsigned char)stream_id;
+    out[2] = (unsigned char)err;
+    return 3;
+}
+
+
+/*
+ * A peer that sends STOP_SENDING has stopped reading this stream. RFC 9000
+ * Section 3.3 puts the sender into 'Reset Sent' once it responds with
+ * RESET_STREAM, and forbids STREAM frames from a terminal state -- so the
+ * bytes already queued for that stream have to go with the reset rather than
+ * being retransmitted into a receiver that will discard them.
+ *
+ * The local-reset path (xqc_stream_close_with_error) and the
+ * RESET_STREAM-receive path (xqc_process_reset_stream_frame) both drop the
+ * queue before writing RESET_STREAM. The STOP_SENDING path writes the reset
+ * without the drop. This test pins the third path to the other two.
+ *
+ * IT COMPILES AND FAILS AGAINST alibaba/xquic main acc8c0b2, where
+ * xqc_process_stop_sending_frame() has exactly the same shape: the assertion
+ * that fails is the queued-packet count, which stays at what it was.
+ */
+void
+xqc_test_stop_sending_drops_queued_stream_packets()
+{
+    xqc_connection_t *conn = test_engine_connect();
+    xqc_stream_t *stream;
+    xqc_packet_in_t pi;
+    unsigned char frame[8];
+    unsigned char payload[1024];
+    size_t written = 0;
+    int queued_before, i, ret;
+
+    CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
+
+    stream = xqc_stream_create_with_direction(conn, XQC_STREAM_BIDI, NULL);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(stream);
+    /* one-byte varint in the frame below */
+    CU_ASSERT_FATAL(stream->stream_id < 64);
+
+    /* enough credit that the writes are not what stops us */
+    stream->stream_flow_ctl.fc_max_stream_data_can_send = 1024 * 1024;
+    conn->conn_flow_ctl.fc_max_data_can_send = 8 * 1024 * 1024;
+    /* an established connection: without this
+     * xqc_write_reset_stream_to_packet() buffers the RESET_STREAM in
+     * sndq_buff_1rtt_packets instead of queueing it to send, and a real
+     * STOP_SENDING does not arrive before the handshake completes. */
+    conn->conn_flag |= XQC_CONN_FLAG_CAN_SEND_1RTT;
+
+    memset(payload, 'z', sizeof(payload));
+    for (i = 0; i < 8; i++) {
+        written = 0;
+        ret = xqc_write_stream_frame_to_packet(conn, stream,
+                                               XQC_PTYPE_SHORT_HEADER, 0,
+                                               payload, sizeof(payload), &written);
+        if (ret < 0) {
+            break;
+        }
+    }
+
+    queued_before = test_ss_count_stream_packets(conn, stream->stream_id);
+    CU_ASSERT_FATAL(queued_before > 0);
+    CU_ASSERT_EQUAL(test_ss_count_reset_packets(conn, stream->stream_id), 0);
+    CU_ASSERT(stream->stream_state_send < XQC_SEND_STREAM_ST_RESET_SENT);
+
+    /* the peer says stop */
+    memset(&pi, 0, sizeof(pi));
+    pi.pos = frame;
+    pi.last = frame + test_ss_put_stop_sending(frame, stream->stream_id, 0x02);
+
+    CU_ASSERT_EQUAL(xqc_process_stop_sending_frame(conn, &pi), XQC_OK);
+
+    /* RESET_STREAM was written -- this half already held before the change */
+    CU_ASSERT(test_ss_count_reset_packets(conn, stream->stream_id) > 0);
+
+    /* THE ASSERTION: nothing is still queued to send on a stream the peer has
+     * told us to stop sending. This is the half the STOP_SENDING path was
+     * missing, and the one that fails on alibaba main. */
+    CU_ASSERT_EQUAL(test_ss_count_stream_packets(conn, stream->stream_id), 0);
+
+    xqc_engine_destroy(conn->engine);
+}
+
+
+/*
+ * The drop must not take an innocent stream's bytes with it.
+ *
+ * xqc_send_ctl_stream_frame_can_drop() discards a packet only when its frame
+ * types lie inside {STREAM, ACK, ACK_MP, SID} AND every used
+ * po_stream_frames[] entry names the stream being dropped, so a packet
+ * carrying two streams' bytes survives. On a concentrator multiplexing eight
+ * flows onto one connection that distinction is the difference between a
+ * correct reset and eight broken downloads, so it is worth a test of its own
+ * rather than a comment.
+ */
+void
+xqc_test_stop_sending_spares_other_streams()
+{
+    xqc_connection_t *conn = test_engine_connect();
+    xqc_stream_t *victim, *bystander;
+    xqc_packet_in_t pi;
+    unsigned char frame[8];
+    unsigned char payload[1024];
+    size_t written = 0;
+    int bystander_before, i, ret;
+
+    CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
+
+    victim = xqc_stream_create_with_direction(conn, XQC_STREAM_BIDI, NULL);
+    bystander = xqc_stream_create_with_direction(conn, XQC_STREAM_BIDI, NULL);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(victim);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(bystander);
+    CU_ASSERT_FATAL(victim->stream_id < 64);
+
+    victim->stream_flow_ctl.fc_max_stream_data_can_send = 1024 * 1024;
+    bystander->stream_flow_ctl.fc_max_stream_data_can_send = 1024 * 1024;
+    conn->conn_flow_ctl.fc_max_data_can_send = 8 * 1024 * 1024;
+    conn->conn_flag |= XQC_CONN_FLAG_CAN_SEND_1RTT;
+
+    memset(payload, 'z', sizeof(payload));
+    for (i = 0; i < 6; i++) {
+        written = 0;
+        ret = xqc_write_stream_frame_to_packet(conn, victim, XQC_PTYPE_SHORT_HEADER,
+                                               0, payload, sizeof(payload), &written);
+        if (ret < 0) {
+            break;
+        }
+        written = 0;
+        ret = xqc_write_stream_frame_to_packet(conn, bystander, XQC_PTYPE_SHORT_HEADER,
+                                               0, payload, sizeof(payload), &written);
+        if (ret < 0) {
+            break;
+        }
+    }
+
+    bystander_before = test_ss_count_stream_packets(conn, bystander->stream_id);
+    CU_ASSERT_FATAL(bystander_before > 0);
+    CU_ASSERT_FATAL(test_ss_count_stream_packets(conn, victim->stream_id) > 0);
+
+    memset(&pi, 0, sizeof(pi));
+    pi.pos = frame;
+    pi.last = frame + test_ss_put_stop_sending(frame, victim->stream_id, 0x02);
+    CU_ASSERT_EQUAL(xqc_process_stop_sending_frame(conn, &pi), XQC_OK);
+
+    CU_ASSERT_EQUAL(test_ss_count_stream_packets(conn, victim->stream_id), 0);
+    /* the bystander keeps every byte */
+    CU_ASSERT_EQUAL(test_ss_count_stream_packets(conn, bystander->stream_id),
+                    bystander_before);
 
     xqc_engine_destroy(conn->engine);
 }
