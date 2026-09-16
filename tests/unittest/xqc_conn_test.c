@@ -984,3 +984,191 @@ xqc_test_alpn_client_handshake_no_alpn(void)
 
     xqc_engine_destroy(conn->engine);
 }
+
+
+/* -------------------------------------------------------------------------
+ * conn_settings.max_recv_window: a ceiling on the PER-STREAM receive window.
+ *
+ * Four things are pinned here, and the first is the upstream argument: a
+ * caller that does not set the field sees exactly the previous behaviour.
+ * ------------------------------------------------------------------------- */
+
+static xqc_connection_t *
+test_conn_with_settings(xqc_engine_t *engine, const xqc_conn_settings_t *settings)
+{
+    xqc_conn_ssl_config_t conn_ssl_config;
+    memset(&conn_ssl_config, 0, sizeof(conn_ssl_config));
+
+    const xqc_cid_t *cid = xqc_connect(engine, settings, NULL, 0, "", 0,
+                                       &conn_ssl_config, NULL, 0, "transport", NULL);
+    if (cid == NULL) {
+        return NULL;
+    }
+    return xqc_engine_conns_hash_find(engine, cid, 's');
+}
+
+/* Unset (0) must behave exactly as the tree did before the setting existed:
+ * the effective ceiling is XQC_MAX_RECV_WINDOW and both advertised
+ * per-stream bidi limits are 16 MiB. This is the no-behaviour-change claim. */
+void
+xqc_test_conn_max_recv_window_defaults(void)
+{
+    xqc_engine_t *engine = test_create_engine();
+    CU_ASSERT_PTR_NOT_NULL_FATAL(engine);
+
+    xqc_conn_settings_t settings;
+    memset(&settings, 0, sizeof(settings));
+    settings.proto_version = XQC_VERSION_V1;
+    /* max_recv_window deliberately left at 0 */
+
+    xqc_connection_t *conn = test_conn_with_settings(engine, &settings);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
+
+    CU_ASSERT_EQUAL(conn->conn_settings.max_recv_window, XQC_MAX_RECV_WINDOW);
+    CU_ASSERT_EQUAL(conn->local_settings.max_stream_data_bidi_local,
+                    XQC_MAX_RECV_WINDOW);
+    CU_ASSERT_EQUAL(conn->local_settings.max_stream_data_bidi_remote,
+                    XQC_MAX_RECV_WINDOW);
+
+    xqc_engine_destroy(engine);
+}
+
+/* A configured ceiling must reach BOTH advertised bidi limits.
+ *
+ * bidi_remote is the one that matters on a server: xqc_stream_set_flow_ctl()
+ * gives an XQC_CLI_BID stream its fc_max_stream_data_can_recv and its
+ * fc_stream_recv_window_size from local_settings.max_stream_data_bidi_remote
+ * when conn_type is SERVER. That assignment used to be a bare
+ * XQC_MAX_RECV_WINDOW outside both branches of the rate-limit if/else, so a
+ * server kept a 16 MiB per-stream window whatever was configured. */
+void
+xqc_test_conn_max_recv_window_clamps_both_directions(void)
+{
+    xqc_engine_t *engine = test_create_engine();
+    CU_ASSERT_PTR_NOT_NULL_FATAL(engine);
+
+    const uint32_t ceiling = 4 * 1024 * 1024;
+
+    xqc_conn_settings_t settings;
+    memset(&settings, 0, sizeof(settings));
+    settings.proto_version = XQC_VERSION_V1;
+    settings.max_recv_window = ceiling;
+
+    xqc_connection_t *conn = test_conn_with_settings(engine, &settings);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
+
+    CU_ASSERT_EQUAL(conn->conn_settings.max_recv_window, ceiling);
+    CU_ASSERT_EQUAL(conn->local_settings.max_stream_data_bidi_local, ceiling);
+    CU_ASSERT_EQUAL(conn->local_settings.max_stream_data_bidi_remote, ceiling);
+    CU_ASSERT(conn->local_settings.max_stream_data_bidi_remote < XQC_MAX_RECV_WINDOW);
+
+    /* The connection-level window is a different resource and must be
+     * untouched -- clamping it would let one paused stream starve every other
+     * stream on the connection. */
+    CU_ASSERT(conn->conn_flow_ctl.fc_max_data_can_recv > ceiling);
+
+    xqc_engine_destroy(engine);
+}
+
+/* A ceiling below the floor is raised to the floor, so the pair can never be
+ * configured into a state where the window starts above its own maximum. */
+void
+xqc_test_conn_max_recv_window_raised_to_init(void)
+{
+    xqc_engine_t *engine = test_create_engine();
+    CU_ASSERT_PTR_NOT_NULL_FATAL(engine);
+
+    const uint32_t floor_win = 8 * 1024 * 1024;
+
+    xqc_conn_settings_t settings;
+    memset(&settings, 0, sizeof(settings));
+    settings.proto_version = XQC_VERSION_V1;
+    settings.init_recv_window = floor_win;
+    settings.max_recv_window = 1 * 1024 * 1024;   /* below the floor */
+
+    xqc_connection_t *conn = test_conn_with_settings(engine, &settings);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
+
+    CU_ASSERT_EQUAL(conn->conn_settings.init_recv_window, floor_win);
+    CU_ASSERT_EQUAL(conn->conn_settings.max_recv_window, floor_win);
+    CU_ASSERT(conn->conn_settings.max_recv_window
+              >= conn->conn_settings.init_recv_window);
+
+    xqc_engine_destroy(engine);
+}
+
+/* The auto-tune doubling in xqc_stream_do_recv_flow_ctl() must stop at the
+ * configured ceiling, not at XQC_MAX_RECV_WINDOW. Without this the setting
+ * would only shape the initial advertisement and the window would climb back
+ * to 16 MiB on the first busy stream -- which is precisely the failure mode
+ * that makes init_recv_window alone useless as a window lever. */
+void
+xqc_test_conn_max_recv_window_caps_autotune(void)
+{
+    xqc_engine_t *engine = test_create_engine();
+    CU_ASSERT_PTR_NOT_NULL_FATAL(engine);
+
+    const uint32_t ceiling = 4 * 1024 * 1024;
+
+    xqc_conn_settings_t settings;
+    memset(&settings, 0, sizeof(settings));
+    settings.proto_version = XQC_VERSION_V1;
+    settings.max_recv_window = ceiling;
+
+    xqc_connection_t *conn = test_conn_with_settings(engine, &settings);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(conn);
+
+    xqc_stream_t *stream = xqc_stream_create_with_direction(conn, XQC_STREAM_BIDI, NULL);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(stream);
+
+    /* Start well under the ceiling so the doubling has somewhere to go. */
+    stream->stream_flow_ctl.fc_stream_recv_window_size = 512 * 1024;
+    stream->recv_rate_bytes_per_sec = 0;
+
+    for (int i = 0; i < 12; i++) {
+        /* Keep available_window under half the window so the branch is taken,
+         * and make the last update look recent so the 2*min_srtt gate passes. */
+        stream->stream_data_in.next_read_offset =
+            stream->stream_flow_ctl.fc_max_stream_data_can_recv;
+        stream->stream_flow_ctl.fc_last_window_update_time = xqc_monotonic_timestamp();
+
+        xqc_stream_do_recv_flow_ctl(stream);
+
+        CU_ASSERT(stream->stream_flow_ctl.fc_stream_recv_window_size <= ceiling);
+    }
+
+    /* It must actually have grown to the ceiling -- otherwise the assertion
+     * above would pass on a stream whose window never moved at all. */
+    CU_ASSERT_EQUAL(stream->stream_flow_ctl.fc_stream_recv_window_size, ceiling);
+
+    xqc_engine_destroy(engine);
+}
+
+
+/* xqc_server_set_conn_settings() copies field by field into
+ * engine->default_conn_settings -- unlike xqc_conn_create(), which assigns the
+ * whole struct. A setting that is not listed there never reaches a server
+ * connection, so the ceiling would bind on the box and be silently ignored by
+ * the concentrator. That is the same asymmetry the bidi_remote clamp exists to
+ * remove, one layer further out, and it is invisible to every client-side
+ * test. */
+void
+xqc_test_conn_max_recv_window_reaches_server(void)
+{
+    xqc_engine_t *engine = test_create_engine_server();
+    CU_ASSERT_PTR_NOT_NULL_FATAL(engine);
+
+    const uint32_t ceiling = 4 * 1024 * 1024;
+
+    xqc_conn_settings_t settings;
+    memset(&settings, 0, sizeof(settings));
+    settings.proto_version = XQC_VERSION_V1;
+    settings.max_recv_window = ceiling;
+
+    xqc_server_set_conn_settings(engine, &settings);
+
+    CU_ASSERT_EQUAL(engine->default_conn_settings.max_recv_window, ceiling);
+    CU_ASSERT(engine->default_conn_settings.max_recv_window < XQC_MAX_RECV_WINDOW);
+
+    xqc_engine_destroy(engine);
+}

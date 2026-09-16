@@ -201,6 +201,11 @@ xqc_server_set_conn_settings(xqc_engine_t *engine, const xqc_conn_settings_t *se
     engine->default_conn_settings.enable_stream_rate_limit =
         settings->enable_stream_rate_limit;
     engine->default_conn_settings.init_recv_window = settings->init_recv_window;
+    /* This copier is field-by-field, so a setting absent from it never reaches
+     * a SERVER connection at all -- the ceiling would bind on a client and be
+     * silently ignored by the server, which is the exact asymmetry the
+     * max_stream_data_bidi_remote clamp exists to remove. */
+    engine->default_conn_settings.max_recv_window = settings->max_recv_window;
     engine->default_conn_settings.initial_rtt = settings->initial_rtt;
     engine->default_conn_settings.initial_pto_duration = settings->initial_pto_duration;
     engine->default_conn_settings.disable_send_mmsg = settings->disable_send_mmsg;
@@ -670,14 +675,25 @@ xqc_conn_init_trans_settings(xqc_connection_t *conn)
             ls->max_streams_uni = XQC_DEFAULT_MAX_STREAMS;
         }
     }
-    ls->max_stream_data_bidi_remote = XQC_MAX_RECV_WINDOW;
+    /* max_stream_data_bidi_remote is the limit this endpoint advertises for
+     * PEER-initiated bidirectional streams, and on a server that is where an
+     * XQC_CLI_BID stream takes both fc_max_stream_data_can_recv and
+     * fc_stream_recv_window_size (xqc_stream_set_flow_ctl). Leaving it at the
+     * built-in 16 MiB would mean a server kept a 16 MiB per-stream window
+     * however max_recv_window was configured -- the configured ceiling would
+     * only ever bind on the client. */
+    ls->max_stream_data_bidi_remote = conn->conn_settings.max_recv_window;
+    /* Unidirectional streams are deliberately not clamped: they carry the H3
+     * control and QPACK encoder/decoder streams, whose windows are not the
+     * per-stream reassembly resource this setting exists to bound. */
     ls->max_stream_data_uni = XQC_MAX_RECV_WINDOW;
 
     if (conn->conn_settings.enable_stream_rate_limit) {
-        ls->max_stream_data_bidi_local = conn->conn_settings.init_recv_window;
+        ls->max_stream_data_bidi_local = xqc_min(conn->conn_settings.init_recv_window,
+                                                 conn->conn_settings.max_recv_window);
 
     } else {
-        ls->max_stream_data_bidi_local = XQC_MAX_RECV_WINDOW;
+        ls->max_stream_data_bidi_local = conn->conn_settings.max_recv_window;
     }
 
     if (conn->conn_settings.is_interop_mode) {
@@ -920,6 +936,21 @@ xqc_conn_create(xqc_engine_t *engine, xqc_cid_t *dcid, xqc_cid_t *scid,
     } else {
         xc->conn_settings.init_recv_window = XQC_MIN_RECV_WINDOW;
     }
+
+    /* Ceiling on the per-stream receive window. 0 selects XQC_MAX_RECV_WINDOW,
+     * so a caller that never sets it gets exactly the previous behaviour.
+     *
+     * Order matters twice, and both orders hold here. It is normalized AFTER
+     * init_recv_window just above, so the raise-to-the-floor below sees the
+     * final floor; and it is normalized BEFORE xqc_conn_init_trans_settings(),
+     * which is the only reader of it in the local-settings path and is called
+     * later in this same function -- the only call site in the tree. Were that
+     * reversed, a caller leaving this at 0 would advertise a zero window. */
+    if (xc->conn_settings.max_recv_window == 0) {
+        xc->conn_settings.max_recv_window = XQC_MAX_RECV_WINDOW;
+    }
+    xc->conn_settings.max_recv_window = xqc_max(xc->conn_settings.max_recv_window,
+                                                xc->conn_settings.init_recv_window);
 
     if (xc->conn_settings.standby_path_probe_timeout) {
         xc->conn_settings.standby_path_probe_timeout = xqc_max(

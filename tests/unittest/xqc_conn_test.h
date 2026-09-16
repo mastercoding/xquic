@@ -32,6 +32,13 @@ void xqc_test_pto_space_no_max_ack_delay_before_confirm(void);
 void xqc_test_0rtt_ack_delay_exponent_default_in_parse(void);
 void xqc_test_0rtt_remote_mad_timeline(void);
 
+/* conn_settings.max_recv_window: ceiling on the per-stream receive window */
+void xqc_test_conn_max_recv_window_defaults(void);
+void xqc_test_conn_max_recv_window_clamps_both_directions(void);
+void xqc_test_conn_max_recv_window_raised_to_init(void);
+void xqc_test_conn_max_recv_window_caps_autotune(void);
+void xqc_test_conn_max_recv_window_reaches_server(void);
+
 /* ALPN negotiation tests (issue #709) */
 void xqc_test_alpn_error_code_value(void);
 void xqc_test_alpn_server_cb_propagates_error(void);

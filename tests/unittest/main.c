@@ -326,6 +326,16 @@ main(int argc, char *argv[])
                         xqc_test_alpn_server_cb_propagates_error)
         || !CU_add_test(pSuite, "xqc_test_alpn_client_handshake_no_alpn",
                         xqc_test_alpn_client_handshake_no_alpn)
+        || !CU_add_test(pSuite, "xqc_test_conn_max_recv_window_defaults",
+                        xqc_test_conn_max_recv_window_defaults)
+        || !CU_add_test(pSuite, "xqc_test_conn_max_recv_window_clamps_both_directions",
+                        xqc_test_conn_max_recv_window_clamps_both_directions)
+        || !CU_add_test(pSuite, "xqc_test_conn_max_recv_window_raised_to_init",
+                        xqc_test_conn_max_recv_window_raised_to_init)
+        || !CU_add_test(pSuite, "xqc_test_conn_max_recv_window_caps_autotune",
+                        xqc_test_conn_max_recv_window_caps_autotune)
+        || !CU_add_test(pSuite, "xqc_test_conn_max_recv_window_reaches_server",
+                        xqc_test_conn_max_recv_window_reaches_server)
         || !CU_add_test(pSuite, "xqc_test_masque", xqc_test_masque)
         || !CU_add_test(pSuite, "xqc_test_datagram_send_on_path", xqc_test_datagram_send_on_path)
         || !CU_add_test(pSuite, "xqc_test_datagram_frame_path_pinning", xqc_test_datagram_frame_path_pinning)
